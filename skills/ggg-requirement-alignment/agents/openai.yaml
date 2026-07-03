@@ -1,0 +1,4 @@
+interface:
+  display_name: "GGG Requirement Alignment"
+  short_description: "需求对齐：用 CodeGraph 验证代码链路、反向影响与残余风险"
+  default_prompt: "使用 $ggg-requirement-alignment 基于 00-baseline.md 提取代码验证清单，先自动识别目标子项目并检查 CodeGraph 初始化状态和索引新鲜度，不可用时再提示初始化或降级；再验证主链路、旧链路副作用、数据身份、复用边界、旧能力反向影响、跨项目依赖、验证点状态、运行时证据缺口和残余风险，生成 01-research.md。"

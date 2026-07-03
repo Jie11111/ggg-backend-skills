@@ -1,0 +1,4 @@
+interface:
+  display_name: "GGG Test Verify"
+  short_description: "测试验证：按需求目录或 quick.md 列场景并保留证据"
+  default_prompt: "使用 $ggg-test-verify 基于本次实现执行 Java 后端测试验证；full 需求按需求目录维护 07-test-report.md 和 test-rounds，quick 小需求优先读取 quick.md，按用户确认边界、diff、review 缺口和代码事实建立轻量应测场景清单，逐项记录证据、缺口和结论。"

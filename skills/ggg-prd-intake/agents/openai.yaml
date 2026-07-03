@@ -1,0 +1,4 @@
+interface:
+  display_name: "GGG PRD Intake"
+  short_description: "需求入口：先确认 quick/full，再落 quick 记录或正式基线"
+  default_prompt: "使用 $ggg-prd-intake 接收需求，先确认本次按 quick 小需求还是 full 正式需求推进；quick 创建轻量 quick.md 记录边界、风险和验收信号，full 再三轮澄清并初始化 meta.json 与 00-baseline.md。"

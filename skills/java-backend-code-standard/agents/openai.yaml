@@ -1,0 +1,4 @@
+interface:
+  display_name: "Java后端代码规范"
+  short_description: "统一Java后端注释日志异常与MyBatis等工程规范执行与评审"
+  default_prompt: "按Java后端代码规范完成开发、修改、重构和代码评审。"
