@@ -1,4 +1,4 @@
 interface:
   display_name: "GGG Technical Design"
-  short_description: "技术方案：先确认实例身份、数据承载和 SQL，再写完整方案"
-  default_prompt: "使用 $ggg-technical-design 先确认业务实例身份、前后端接口协作流骨架和 MySQL/Redis/ES/MQ/配置的数据承载选择；涉及 MySQL 变更时先做 SQL 字段风格参考、表准入和字段准入检查，产出 04-schema.sql 并等用户确认 SQL 后，再写 02-design.md 和 interface-details，并做残留口径自检。"
+  short_description: "轻量设计可实现的 Java 后端方案、契约与数据变更"
+  default_prompt: "使用 $ggg-technical-design 基于已闭合的需求和代码结论完成最小、可实现的后端技术方案，并在任务拆分前确认必要的数据库变更。"

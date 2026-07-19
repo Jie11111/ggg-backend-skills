@@ -1,4 +1,4 @@
 interface:
   display_name: "GGG Implementation"
-  short_description: "按任务或 quick.md 边界落 Java 代码，含质量自检和验证"
-  default_prompt: "使用 $ggg-implementation 基于已确认的 02-design.md、03-tasks.md、04-schema.sql 和 interface-details 落 Java 后端代码；如是 quick 小需求，则读取或创建 quick.md，按用户确认边界快速定位、最小实现、自检和局部验证，偏离设计/接口/SQL/任务或 quick 边界时暂停确认或回写。"
+  short_description: "按风险实现已确认任务，用新鲜验证绑定当前真实代码差异"
+  default_prompt: "使用 $ggg-implementation 按已确认任务选择风险档位，完成编码前预检、纵向实现、真实命令验证并锁定当前差异。"

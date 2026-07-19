@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import workflow_validation as validator
+from sync_clarification_impact import phase_reached, reopen_baseline_confirmation, reset_from_baseline
 
 
 def load_json(path: Path) -> dict:
@@ -28,15 +29,19 @@ def main() -> None:
         raise SystemExit("缺少 meta.json")
 
     meta = load_json(meta_path)
-    blockers_path = feature_dir / "01-blocking-issues.md"
+    meta.pop("blocking_issue_count", None)
+    research_path = feature_dir / "01-research.md"
     unresolved = 0
-    if blockers_path.exists():
-        unresolved = validator.unresolved_blockers(blockers_path.read_text(encoding="utf-8"))
-    meta["blocking_issue_count"] = unresolved
-
+    if research_path.exists():
+        unresolved = validator.unresolved_research_questions(research_path.read_text(encoding="utf-8"))
+    if (feature_dir / "01-blocking-issues.md").exists():
+        # 旧文件必须先合并迁移，避免切换单一账本后静默丢失阻塞问题。
+        unresolved += 1
     phase = meta.get("current_phase", "需求受理")
     gates = meta.setdefault("gates", {})
     for key in [
+        "clarification_required",
+        "clarification_confirmed",
         "alignment_completed",
         "design_confirmed",
         "tasks_confirmed",
@@ -46,10 +51,13 @@ def main() -> None:
         "release_ready",
         "business_model_confirmed",
         "upstream_contract_confirmed",
+        "schema_confirmed",
     ]:
         gates.setdefault(key, False)
+    if int(meta.get("workflow_schema_version", 1)) >= 3:
+        gates["clarification_required"] = True
     review_flags = validator.ensure_review_flags(meta)
-    meta.setdefault(
+    clarification = meta.setdefault(
         "clarification",
         {
             "count": 0,
@@ -57,12 +65,81 @@ def main() -> None:
             "last_summary": "",
             "last_updated_at": "",
             "last_impacts": [],
+            "confirmed_baseline_sha256": "",
+            "baseline_confirmation_source": "",
+            "baseline_confirmed_at": "",
         },
     )
+    for key, value in {
+        "confirmed_baseline_sha256": "",
+        "baseline_confirmation_source": "",
+        "baseline_confirmed_at": "",
+    }.items():
+        clarification.setdefault(key, value)
 
-    baseline_ready = not validator.validate_baseline_doc(feature_dir / "00-baseline.md")
+    schema_confirmation = meta.setdefault(
+        "schema_confirmation",
+        {"confirmed_schema_sha256": "", "confirmation_source": "", "confirmed_at": ""},
+    )
+    for key in ["confirmed_schema_sha256", "confirmation_source", "confirmed_at"]:
+        schema_confirmation.setdefault(key, "")
+    schema_path = feature_dir / "04-schema.sql"
+    if gates.get("schema_confirmed"):
+        current_schema_sha = validator.schema_fingerprint(validator.read_text(schema_path)) if schema_path.exists() else ""
+        if not current_schema_sha or current_schema_sha != schema_confirmation.get("confirmed_schema_sha256", ""):
+            gates["schema_confirmed"] = False
+            schema_confirmation["confirmed_schema_sha256"] = ""
+            schema_confirmation["confirmation_source"] = ""
+            schema_confirmation["confirmed_at"] = ""
+            gates["design_confirmed"] = False
+            review_flags["design_needs_review"] = True
+
+    clarification_required = bool(gates.get("clarification_required", False))
+    baseline_path = feature_dir / "00-baseline.md"
+    baseline_text = validator.read_text(baseline_path)
+    current_fingerprint = validator.baseline_business_fingerprint(baseline_text) if baseline_text else ""
+    confirmed_fingerprint = str(clarification.get("confirmed_baseline_sha256", "")).strip()
+
+    if (
+        clarification_required
+        and gates.get("clarification_confirmed")
+        and confirmed_fingerprint
+        and current_fingerprint != confirmed_fingerprint
+    ):
+        reset_from_baseline(gates)
+        gates["schema_confirmed"] = False
+        schema_confirmation["confirmed_schema_sha256"] = ""
+        schema_confirmation["confirmation_source"] = ""
+        schema_confirmation["confirmed_at"] = ""
+        reopen_baseline_confirmation(baseline_path)
+        meta["current_status"] = "待澄清"
+        if phase_reached(phase, "需求对齐"):
+            review_flags["alignment_needs_review"] = True
+            review_flags["design_needs_review"] = True
+        if phase_reached(phase, "任务拆分"):
+            review_flags["tasks_needs_review"] = True
+
+    baseline_ready = not validator.validate_baseline_doc(
+        baseline_path,
+        clarification_gate_required=clarification_required,
+    )
+    if clarification_required:
+        current_fingerprint = validator.baseline_business_fingerprint(validator.read_text(baseline_path))
+        gates["clarification_confirmed"] = bool(
+            baseline_ready
+            and gates.get("clarification_confirmed")
+            and confirmed_fingerprint
+            and current_fingerprint == confirmed_fingerprint
+        )
+    research_text = validator.read_text(feature_dir / "01-research.md")
     research_ready = not validator.validate_research_doc(feature_dir / "01-research.md")
-    design_ready = not validator.validate_design_doc(feature_dir / "02-design.md", feature_dir / "interface-details")
+    design_ready = not validator.validate_design_doc(
+        feature_dir / "02-design.md",
+        feature_dir / "interface-details",
+        validator.extract_claim_ids_from_research(research_text),
+        validator.extract_design_eligible_claim_ids_from_research(research_text),
+        validator.extract_transferred_design_question_ids_from_research(research_text),
+    )
     tasks_ready = not validator.validate_tasks_doc(feature_dir / "03-tasks.md")
     implementation_log = feature_dir / "05-implementation-log.md"
     code_review = feature_dir / "06-code-review.md"
@@ -78,10 +155,9 @@ def main() -> None:
     elif review_flags.get("design_needs_review") or review_flags.get("tasks_needs_review"):
         meta["current_status"] = "待重审"
     elif phase == "需求受理":
-        meta["current_status"] = "调研中"
+        meta["current_status"] = "已确认" if gates.get("clarification_confirmed") else "待澄清"
     elif phase == "需求对齐":
-        blockers_exists = blockers_path.exists()
-        meta["current_status"] = "已对齐" if baseline_ready and research_ready and blockers_exists and unresolved == 0 else "调研中"
+        meta["current_status"] = "已对齐" if baseline_ready and research_ready and unresolved == 0 else "调研中"
         gates["alignment_completed"] = meta["current_status"] == "已对齐"
         if gates["alignment_completed"]:
             review_flags["alignment_needs_review"] = False

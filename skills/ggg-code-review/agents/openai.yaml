@@ -1,4 +1,4 @@
 interface:
   display_name: "GGG Code Review"
-  short_description: "代码检查：复核 quick.md/需求边界、diff 和质量风险"
-  default_prompt: "使用 $ggg-code-review 检查本次 Java 后端实现；full 需求先复核 PRD、baseline、research、design、tasks、SQL 和接口契约一致性，quick 小需求则优先读取 quick.md，对照用户确认边界、diff、代码事实和验证证据，之后执行幻觉审计和代码质量补查。"
+  short_description: "优先 fresh context，分两门检查完整差异并披露评审方式"
+  default_prompt: "使用 $ggg-code-review 优先通过 fresh-context 评审当前完整差异，不可用时显式降级 self-review，再完成 Gate A、Gate B 和结论绑定。"

@@ -26,6 +26,7 @@ def main() -> None:
         raise SystemExit(1)
 
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.pop("blocking_issue_count", None)
     current_phase = meta.get("current_phase", "")
     target_phase = args.to_phase
 
@@ -62,6 +63,11 @@ def main() -> None:
     if target_idx < PUBLIC_PHASES.index("技术方案"):
         gates["alignment_completed"] = False
         gates["design_confirmed"] = False
+        gates["schema_confirmed"] = False
+        confirmation = meta.setdefault("schema_confirmation", {})
+        confirmation["confirmed_schema_sha256"] = ""
+        confirmation["confirmation_source"] = ""
+        confirmation["confirmed_at"] = ""
     if target_idx < PUBLIC_PHASES.index("任务拆分"):
         gates["design_confirmed"] = False
         gates["tasks_confirmed"] = False

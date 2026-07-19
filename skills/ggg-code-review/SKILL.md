@@ -1,322 +1,138 @@
 ---
 name: ggg-code-review
-description: 代码检查阶段。GGG 作为 Java 后端代码评审者，基于 git diff、PRD/需求原文、`00-baseline.md`、`01-research.md`、`02-design.md`、`03-tasks.md`、`04-schema.sql`、`interface-details/` 和代码事实，先做可评审性与逐文件 diff 反查，再复核 PRD/需求、代码调研、技术方案、任务拆分、SQL 和接口契约一致性，并执行幻觉审计；无需求目录的 quick 小需求则基于 `ggg/quick/.../quick.md` 或用户确认边界、diff、代码事实和验证证据做普通后端 review；如果本次使用多 agent 并行编码，还必须审查 worker 文件锁、实际修改范围、越界改动、同文件冲突、合并顺序和集成验证；最后按 `references/code-review-quality-checklist.md` 补查必要代码质量、安全、注释日志和测试风险。仅当用户明确指定 `$ggg-code-review`，或明确要求“检查代码 / 代码评审 / review 本次改动 / 看看需求方案是否一致 / 看看还有没有问题 / 实现后检查 / 并行实现后检查 / quick 改动复查”时使用。
+description: 代码检查阶段。GGG 优先使用无 implementation 历史的 fresh-context 评审者，把当前完成快照冻结为 Review 输入；fresh 能力不可用时显式降级为 self-review。先执行需求符合性 Gate A，再按真实 diff 风险执行代码质量 Gate B；结论覆盖全部差异文件并绑定评审方式、实现轮次、实现差异指纹、Review 输入指纹和 Review 工件指纹。用于用户明确指定 `$ggg-code-review`，或要求检查代码、本轮实现复查、quick 改动复查、看看还有没有问题时。
 ---
 
-# GGG Code Review（代码检查）
+# GGG Code Review
 
 ## 定位
 
-GGG 在这个阶段切换成代码评审者。目标不是继续写需求，也不是顺手重构，而是判断本次实现是否真正符合 PRD/需求原文、需求基线、代码调研、技术方案、任务拆分、SQL、接口契约和代码事实，并且能否安全进入测试验证。
+判断本轮实现是否“实现了正确的内容”，再判断“实现质量是否足以进入测试”。默认只评审不修复；需要修改时，记录 CRxx 后回到 `$ggg-implementation` 开启新实现轮次，代码变化后重新 Review。
 
-**先审一致性，再审代码质量**：评审顺序固定为可评审性、PRD/需求一致性、方案/任务一致性、diff 反查、并行合并审查、幻觉审计、代码质量补查。
+有效 Review 必须满足：
 
-**PRD/需求是第一层一致性来源**：`00-baseline.md` 是需求受理后的基线，不替代 PRD/用户原始需求。若 PRD/用户新确认与 baseline、design、tasks 冲突，先指出冲突；无法判断时列为阻塞并向用户确认。
+- Gate A `Spec Compliance` 先于 Gate B `Code Quality`。
+- 优先由无 implementation 历史的 fresh-context 评审者读取权威口径和原始 diff；不可用时显式记录 `self-review` 及原因。
+- 先形成评审判断，才能把 implementation 自检作为交叉线索。
+- 全部真实 diff 文件逐项覆盖；指定文件只是入口，不得缩小必要影响面。
+- 结论绑定实现轮次、实现差异指纹、Review 输入指纹和由状态机计算的 Review 工件指纹。
+- CRxx 全局单调递增且 append-only；复审只更新状态和关闭依据，不删除或复用编号。
 
-**幻觉审计是固定门禁**：必须检查需求、research、design、tasks、diff、实现日志和测试证据之间是否存在无证据结论、文档写了但代码没实现、代码实现了但文档没记录、测试声称通过但没有执行证据、把未覆盖写成不存在。
+## 读取资源
 
-**默认只评审不修复**：除非用户明确要求“review 并修复 / 直接修掉”，否则只输出评审问题。注释、日志和 Trace 漏项默认打回 `$ggg-implementation`，不在 review 阶段顺手补。
+- Java 后端改动：读取 `../ggg-java-coding-standard/SKILL.md`。
+- 执行 Gate B：读取 `references/code-review-quality-checklist.md`，只加载被 diff 触发的风险模块。
+- full：读取 baseline、research、design、tasks、SQL、接口明细、实现记录和历史 Review。
+- quick：读取 `quick.md`、同目录按需产物、实现状态和历史 Review 结论。
+- 始终读取 Git 已暂存、未暂存、未跟踪文件及必要直接上下游。
 
-**Review 结论要资产化**：有需求目录时，每轮维护 `06-code-review.md` 索引，并新增 `review-rounds/review-rNN.md` 明细；复审新增下一轮，不覆盖历史。
+权威顺序：用户最新确认/PRD → baseline 或 quick 边界 → research/design/tasks/契约 → 代码与运行事实。派生文档冲突时记录应回写位置；业务口径无法确定时阻塞，不用推断补齐。
 
-如果本次是无需求目录的 quick 小需求，评审不强制要求 baseline、research、design、tasks、SQL 和接口明细齐全；但必须优先读取 `quick.md`，对照 quick 边界、git diff、代码事实和验证证据，判断是否越界、是否需要升级 full。
+## 执行流程
 
-## 评审原则和质量清单
+### 1. 冻结 Review 输入
 
-外部通用 review 原则只作为补充：保持变更可评审、优先发现正确性/安全/性能/兼容/测试风险、结论区分通过/需修改/阻塞。
-
-开始评审前必须实际读取并应用：
-
-- `../java-backend-code-standard/SKILL.md`，按需读取 `../java-backend-code-standard/references/java-backend-guidelines.md`。
-- `../jzx-personal-java-style/SKILL.md`，按需读取 `../jzx-personal-java-style/references/author-style.md`。
-- 做代码质量补查前读取 `references/code-review-quality-checklist.md`。
-
-规范优先级：
-
-1. 当前项目硬约束和代码事实优先。
-2. PRD/用户最新确认的业务口径优先。
-3. 当前文件、模块和链路的局部一致性优先。
-4. Java 后端硬规范优先。
-5. 作者个人风格优先。
-6. 外部通用 review 原则只做补充。
-
-## 触发和修复边界
-
-- 只有用户明确指定 `$ggg-code-review`，或明确要求“检查代码 / 代码评审 / review 本次改动 / 看看需求方案是否一致 / 看看还有没有问题 / 看看规范和性能问题 / 实现后检查 / 并行实现后检查 / quick 改动复查”时才执行。
-- 如果用户只是要求编码实现，使用 `$ggg-implementation`。
-- 如果用户要求排查线上问题或 bug 根因，使用 `$ggg-bug-fix`。
-- 如果用户要求“直接修代码”，先给评审问题和准备修复范围，再按 `$ggg-implementation` 的约束做最小修复，修完后重新 review 新 diff。
-
-## 前置输入
-
-优先读取：
-
-- `git status --short`、本次相关 `git diff`、`git diff --cached`，以及未跟踪新文件内容。
-- 用户指定的文件、提交、分支、需求目录、PRD 原文或需求说明。
-- 需求目录里的 `00-baseline.md`、`01-research.md`、`02-design.md`、`03-tasks.md`、`04-schema.sql`、`interface-details/`。
-- 需求目录里的 `05-implementation-log.md`、`06-code-review.md` 和 `review-rounds/`，用于识别实现轮次、历史 review 轮次和未关闭问题。
-- 本次实现涉及的 Controller、Service、Facade、Mapper、DTO、枚举、配置、依赖和测试。
-
-如果没有 PRD 原文，用用户本轮明确说明和 `00-baseline.md` 做需求一致性依据；如果没有任务文档，也可以基于用户指定 diff 或文件做普通 Java 后端代码评审，但要说明依据缺失。
-
-如果是 quick 小需求且没有需求目录，用 `ggg/quick/.../quick.md`、`$ggg-prd-intake` 或用户本轮确认的 quick 边界作为需求依据；如果 review 发现实现范围、接口契约、SQL、权限、状态、旧链路副作用或验证缺口超出 quick 边界，结论应建议升级 full 或打回实现确认。
-
-## 执行步骤
-
-### 第一步：收敛评审范围和 diff 事实
-
-如果存在需求目录，且当前 `meta.json.current_phase` 仍是 `编码实现`，先确认 `05-implementation-log.md` 已记录本轮实现，再推进到代码检查阶段：
+先执行：
 
 ```bash
-py ../ggg-workflow-shared/scripts/workflow_cli.py to-review --feature-dir <feature-dir> --implementation-completed
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow_cli.py" implementation-status \
+  --record <quick.md或05-implementation-log.md>
 ```
 
-如果当前阶段已经是 `代码检查` 或后续阶段，不重复推进；直接按本轮 diff 和 review 轮次继续。
+实现未完成、状态缺失或差异指纹失效时，返回 implementation，不产生有效 Review。
 
-先执行 `git status --short`，识别本次改动和已有脏文件。再按用户指定范围读取未暂存 diff、已暂存 diff 和未跟踪新文件。
+full 仍在编码实现阶段时执行：
 
-范围规则：
-
-- 指定文件：只看指定文件及其直接上下游。
-- 指定任务：看任务对应 diff、主链路和测试。
-- 未指定范围：优先看工作区未提交 diff、已暂存 diff 和未跟踪新文件。
-
-不要做全仓无边界评审。无关历史问题只在影响本次改动时记录。
-
-先做可评审性门禁：
-
-- diff 是否混入多个互不相关需求、无关格式化、批量重排 import、自动生成文件或大面积历史清理。
-- diff 是否包含 SQL、配置、接口契约、依赖、测试、业务代码多个高风险面但没有任务映射。
-- 新增/删除文件是否都能对应 `03-tasks.md`、worker 分配、PRD/需求或明确用户要求。
-- 如果 diff 过大导致无法可靠 review，结论不能直接通过，要求按任务、模块或风险面拆分后复审。
-
-建立逐文件改动清单：
-
-```text
-| 文件 | 变更类型 | 来源任务/worker | PRD/设计/接口/SQL 映射 | 风险面 | 验证证据 |
-|---|---|---|---|---|---|
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow_cli.py" to-review \
+  --feature-dir <feature-dir> --implementation-completed
 ```
 
-变更类型使用：`业务代码`、`接口契约`、`SQL/Mapper`、`配置`、`依赖`、`测试`、`文档`、`生成文件`。
+建立 Review Package：
 
-### 第二步：理解 PRD/需求和方案口径
+1. 固定对应实现轮次和实现差异指纹。
+2. 枚举全部真实 diff 路径及变更类型，包含未跟踪新文件。
+3. 记录权威输入文件及 digest，生成 Review 输入指纹。
+4. 标记每个 diff 文件的来源、行为影响、风险标签和所需证据。
+5. 先形成独立判断，再读取 implementation 自检交叉核对；自检不是通过证据。
 
-按权威顺序确认本次实现应该满足什么：
+无关需求、生成噪音或大面积历史清理应先拆分。任何 diff 文件未进入覆盖清单时不得通过。
 
-1. 用户本轮最新确认、PRD 原文、需求说明。
-2. `00-baseline.md`：需求目标、用户路径、业务规则、数据身份、范围和验收口径。
-3. `01-research.md`：代码对齐结论、主链路、可复用点、限制和证据。
-4. `02-design.md`：技术方案、接口、状态、依赖、影响范围和设计决策。
-5. `03-tasks.md`：本次应该完成的开发任务、来源依据、并行组和完成标准。
-6. `04-schema.sql` 与 `interface-details/`：表结构、字段、索引、接口入参、出参、异常和处理流程。
+### 1.1 选择评审上下文
 
-quick 模式没有需求目录时，权威顺序简化为：`quick.md` > 用户最新确认的 quick 边界 > PRD/需求原文 > git diff 和代码事实 > 实现说明 / 验证证据。不要因为缺少 `00-04` 文档就要求补完整流程，但发现影响面无法判断时要建议升级 full。
+- 能启动 subagent 或 fresh thread 时，使用无历史上下文的 reviewer（例如 `fork_turns="none"`）；只提供冻结的 Review Package、权威需求工件、完整 diff 和必要代码入口，不传实现讨论、预期结论或当前 Agent 的诊断。
+- fresh reviewer 负责 Gate A、Gate B、CRxx 和 Review 报告；协调 Agent 只运行确定性登记，不改写 reviewer 的发现。
+- fresh 能力不可用或启动失败时，直接降级为 `self-review` 并记录具体原因，不增加用户确认轮次。
+- `self-review` 可以继续门禁，但不得表述为“独立评审”；最终回复必须明确说明本轮评审方式。
 
-如果文档之间互相不一致：
+### 2. Gate A：Spec Compliance
 
-- PRD/用户最新确认与 baseline/design/tasks 冲突：列为一致性问题，说明应该回写哪些文档。
-- baseline/research/design/tasks 之间冲突：先说明冲突点；能根据代码事实和最新确认判断的，给出结论和回写建议。
-- 无法判断业务口径、接口契约、表结构或发布风险时，列为阻塞并向用户确认。
+按真实用户路径和必要影响面回答：
 
-### 第三步：做一致性复核
+1. 是否存在需求要求但未实现的行为。
+2. 是否存在已实现但语义、边界或副作用错误的行为。
+3. 是否存在超出确认范围的行为。
+4. 接口、身份、权限、状态、SQL、事务、数据迁移及兼容性是否偏离确认口径。
+5. 文档承诺、代码行为和“已验证”声明是否都有独立证据；未查证不得写成不存在。
 
-先检查“写出来的代码是不是原来要写的东西”，再检查代码质量。
+full 逐项覆盖 Bxx/Cxx/Dxx/Txx 和按需接口、SQL；quick 覆盖目标、禁止项及每个 diff 文件的来源。局部类名或分层不同但行为正确不构成问题。
 
-full 模式必须逐项对照：
+Gate A 只允许 `通过 / 需修改 / 阻塞`。未通过时记录 CRxx 并返回 implementation；可停止常规 Gate B，但已发现的安全、数据破坏等高风险问题仍须记录。
 
-- PRD/需求一致性：是否覆盖 PRD 明确的功能、用户路径、业务规则、数据身份、状态边界、验收标准和非目标；是否做了 PRD 范围外能力。
-- 需求基线一致性：是否漏做 `00-baseline.md` 明确要求，是否违背已确认口径。
-- 代码调研一致性：实现入口、Service、Facade、Mapper、异步链路是否符合 `01-research.md` 的代码对齐结论和限制。
-- 技术方案一致性：类、方法、状态、枚举、缓存、MQ、ES、事务边界是否符合 `02-design.md`。
-- 任务拆分一致性：`03-tasks.md` 中每个任务是否都有代码落点、验证证据或明确无需实现原因。
-- SQL 一致性：新增字段、索引、逻辑删除、默认值、历史数据处理是否符合 `04-schema.sql`。
-- 接口契约一致性：Controller 路径、请求方式、入参、出参、错误处理、权限、兼容性是否符合 `interface-details/`。
-- 测试链路一致性：实现是否具备方案要求的验证点，是否缺少关键回归。
+### 3. Gate B：Risk-driven Code Quality
 
-quick 模式没有需求目录时，必须逐项对照：
+Gate A 通过后，按 checklist 执行：
 
-- quick 边界一致性：是否只实现用户确认的改动范围，是否做了不做范围里的内容。
-- diff 反查一致性：新增 / 修改 / 删除文件是否都能解释为 quick 目标的一部分。
-- 接口 / SQL / 配置影响：如果有改动，是否仍能用 quick 边界解释，影响面是否可判断。
-- 验证一致性：实现说明里的已验证项是否有命令、响应、日志或代码证据支撑。
-- 升级判断：如果业务口径、权限、状态、旧链路副作用或影响面无法判断，结论建议升级 full。
+- 始终检查正确性、安全与权限、数据一致性、失败边界、兼容性、验证充分性。
+- 根据 diff 触发 API、SQL/事务、DDL/迁移、MQ/异步、缓存/ES、配置/依赖、性能/可观测性、前端等模块。
+- formatter、lint、编译、静态扫描和已有测试使用真实命令证据；不能由模型手填“通过”替代。
+- 没有新增测试本身不是问题；高风险行为缺少自动化测试或明确豁免依据时属于验证缺口。
 
-偏差处理：
+只记录影响正确性、安全、兼容、可维护性或后续修改安全的问题，不把个人偏好和无关历史坏味道列为本轮必须修。
 
-- 漏实现 PRD/需求、任务或接口契约：列为 `必须修` 或 `阻塞`。
-- 业务规则、接口契约、表结构、权限、数据一致性偏差：列为 `阻塞`。
-- 代码比方案更贴近真实代码但文档未回写：列为 `建议修` 或 `必须修`，说明应回写的文档。
-- 类名、方法名、局部分层不同但行为一致且更贴近现有代码：列为 `提示` 或不列问题。
+### 4. 问题连续性与复审
 
-### 第四步：多 agent 并行合并审查
+- 新问题使用下一个 CRxx，不按轮次重新编号。
+- 新轮次继承全部历史未关闭 CRxx，并记录本轮状态、实现轮次和关闭证据。
+- `fixed` 必须由新 diff 和复审证据支持；风险接受仅适用于用户有权接受且不违反硬约束的事项。
+- 代码、SQL、配置或测试发生任何变化后，旧 Review 立即失效；重新完成 implementation 并生成新的 Review Package。
 
-如果本次没有使用多 agent 并行实现，可跳过本步骤。
+### 5. 写入结论并绑定
 
-必须先从 `03-tasks.md`、`05-implementation-log.md`、实现最终说明和 git diff 反查实际 worker 边界，不能只相信 worker 自报。
+full 新增 `review-rounds/review-rNN.md`，更新 `06-code-review.md`；quick 回写 `quick.md` 的两门 Gate、完整 diff 覆盖和问题。先完成全部报告内容，再执行登记；Review 工件指纹只由 `review-mark` 写入 `implementation-state.json`，报告不回填、不自报该指纹。
 
-检查项：
+报告已经明确写出的 `fresh-review / self-review` 及原因是权威来源；登记命令只补模板占位，不得覆盖冲突内容。
 
-- 文件锁：每个 worker 实际修改文件是否都在允许范围内。
-- 越界改动：是否修改禁止文件、只读参考文件、其他 worker 文件或未分配文件。
-- 同文件冲突：是否两个 worker 修改同一个 Java、XML、SQL、配置或接口契约文件。
-- 契约锁定：Provider/Consumer、HTTP 接口、MQ 生产/消费、SQL 字段、配置口径是否在并行前锁定。
-- 合并顺序：基础层、SQL/Mapper、Service、Controller、测试是否按任务依赖合并。
-- 集成验证：worker 局部验证之外，coordinator 是否做合并后的组级验证。
-- 文档回写：并行过程中发现接口、SQL、任务边界或设计变化，是否回写权威文档。
+最终结论：
 
-严重程度：
+- `通过`：Gate A、Gate B 均通过，没有未关闭的阻塞或必须修问题，全部 diff 已覆盖。
+- `需修改`：存在必须修问题或重要验证缺口。
+- `阻塞`：需求、接口、表结构、安全、数据一致性或运行事实无法确认。
 
-- worker 修改禁止文件、同一文件被多个 worker 修改、契约未锁定就两端并行改：`阻塞`。
-- worker 实际修改文件未纳入任务或没有集成验证：`必须修`。
-- 合并顺序说明不清、任务状态未更新但代码行为可确认：`建议修`。
+最后执行：
 
-### 第五步：执行幻觉审计
-
-一致性复核后、代码质量检查前，必须做幻觉审计。目标是确认所有影响交付的结论都有证据、所有实现都能回到 PRD/需求/方案/任务、所有测试结论都有执行依据。
-
-必须检查：
-
-- 无证据结论：`01-research.md`、`02-design.md`、`03-tasks.md`、实现交付和 review 结论里，是否存在没有 `Cxx/Exx`、文件行号、命令输出、接口响应或运行证据支撑的关键判断。
-- PRD/文档有但代码未实现：PRD、baseline、方案、接口明细、SQL 或任务里承诺的能力，是否在 diff 或现有代码中没有落点。
-- 代码实现但 PRD/文档/任务未记录：diff 是否出现范围外接口、字段、配置、SQL、枚举、异步逻辑或旧链路接入。
-- 测试声称通过但无执行证据：实现日志、测试报告或最终交付中是否写了“通过/已验证”，但没有命令、退出码、请求响应、日志、DB/ES/Redis 回查或截图证据。
-- 未覆盖被写成不存在：是否把 CodeGraph 未命中、`rg` 未搜到、配置未查、运行时未验证写成“没有”或“不会发生”。
-- 证据等级越权：`推断 / 未覆盖 / 阻塞` 是否被下游方案、任务或测试结论当作确定事实。
-
-有需求目录时，幻觉审计结论必须写入 `review-rounds/review-rNN.md`；quick 模式没有需求目录时，必须写入最终评审结论，并在 `quick.md` 存在时回写第 5 节的 Review 结论：
-
-```text
-| 审计项 | 结论 | 证据 | 风险 | 处理建议 |
-|---|---|---|---|---|
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow_cli.py" review-mark \
+  --record <quick.md或05-implementation-log.md> \
+  --result <passed|needs_changes|blocked> \
+  --reviewer-mode <fresh-review|self-review> \
+  [--self-review-reason "<仅 self-review 必填的具体原因>"]
 ```
 
-严重程度：
+命令失败或任一指纹与当前状态不一致时，本轮结论不得生效。通过时只需报告评审方式、结论、CRxx、剩余风险和未覆盖验证；没有问题则明确说明未发现需要修改的问题。只有 `fresh-review` 可以称为独立评审。
 
-- 影响业务口径、接口契约、SQL、权限、状态隔离、数据一致性或旧链路副作用的无证据结论：`阻塞`。
-- 文档和代码不一致但可通过回写或补实现收口：`必须修`。
-- 测试缺执行证据但不影响当前 review 判断代码质量：`建议修` 或测试验证缺口。
-- 只是证据描述不够具体，但 diff、文件行号或命令输出可直接补齐：`提示`。
+登记后只读确认：
 
-### 第六步：按质量清单补查代码风险
-
-读取并执行 `references/code-review-quality-checklist.md`。不要在主提示词里展开通用 Java review 手册，质量细则以该文件为准。
-
-最低补查范围：
-
-- 功能正确性、主链路可读性、无效抽象、过度设计、职责边界。
-- 接口参数、DTO 类型、JSON 入参、权限身份、兼容性。
-- SQL/MyBatis、N+1、逻辑删除、租户/组织/状态过滤、批量和分页。
-- 事务、异常、MQ/缓存/ES/WebSocket 一致性。
-- 性能、资源、安全、敏感信息、幂等和并发。
-- 注释、方法注释、业务边界注释、日志/Trace 和异常日志。
-- 依赖、配置、开关、发布回滚和测试验证证据。
-
-如果质量问题会改变接口、SQL、事务、配置默认值、任务范围或业务口径，必须回到一致性复核并按风险升级。
-
-### 第七步：复审修复和验证闭环
-
-如果用户要求 review 后直接修复，或实现方按评审意见修改后再次提交：
-
-- 重新读取新的 git diff，不沿用旧结论。
-- 只复审已修复问题及其影响范围；如果修复扩大到接口、SQL、配置、事务或核心链路，要重新做一致性复核和幻觉审计。
-- 之前通过的结论在修复后不自动有效。
-- 所有 `必须修` 和 `阻塞` 问题都必须有修复证据或用户明确接受的风险说明。
-
-### 第八步：输出评审结论并资产化
-
-评审结果按严重程度排序，先说问题，不先写总结。
-
-如果存在需求目录，先写入 review 轮次产物：
-
-- `06-code-review.md` 不存在时，从 `../ggg-workflow-shared/assets/workflow/templates/code-review-index-template.md` 创建。
-- `review-rounds/` 不存在时创建目录；本轮明细从 `code-review-round-template.md` 创建，命名为 `review-rNN.md`。
-- 每次评审新增 `R1/R2/R3...` 轮次，不覆盖旧轮次。
-- `06-code-review.md` 只维护轮次索引、当前结论和未关闭问题。
-- `review-rNN.md` 写本轮评审范围、结论、问题清单、PRD/需求一致性复核、方案/任务一致性复核、diff 反查、幻觉审计和修复闭环。
-- 复审时必须读取上一轮未关闭问题，标记 `fixed/accepted/not-applicable/open`，并把仍未关闭的问题保留到索引。
-
-如果没有需求目录但存在 quick 记录：
-
-- 不创建 `06-code-review.md` 或 `review-rounds/`。
-- 将本轮 Review 结论、主要问题数量、是否越界、是否建议升级 full 写入 `quick.md` 第 5 节。
-- 如果没有 quick 记录，最终回复中给出等价评审摘要，并说明没有落文件的原因。
-
-每个问题必须包含：
-
-- 严重级别：`阻塞`、`必须修`、`建议修`、`提示`。
-- 文件和行号；全局验证缺口、文档缺口或发布风险可以不绑定单行，但必须说明依据。
-- 问题现象、风险影响、建议改法。
-- 如果是 PRD/需求/方案偏差，说明偏离了哪个文档或接口契约。
-- 如果是多 agent 并行问题，说明对应 worker、允许修改范围、实际修改文件和冲突类型。
-
-结论只允许三种：
-
-- `通过`：没有阻塞或必须修问题，测试风险可接受。
-- `需修改后通过`：存在必须修问题或重要验证缺口。
-- `阻塞`：存在业务口径、接口契约、表结构、安全、数据一致性或严重性能问题，不能进入测试验证。
-
-最终回复必须单独说明：
-
-- 可评审性：通过 / 需拆分 / 有无关改动。
-- PRD/需求一致性：通过 / 有偏差 / 缺少 PRD 依据。
-- 方案/任务/SQL/接口一致性：通过 / 有偏差。
-- 并行合并审查：未使用 / 通过 / 有问题。
-- 幻觉审计：通过 / 有问题。
-- 代码质量：通过 / 有问题。
-- 注释和日志链路：通过 / 有问题。
-- 测试验证缺口：有 / 无。
-
-## 输出格式
-
-```text
-评审结论：通过 / 需修改后通过 / 阻塞
-
-问题：
-- [严重级别] 文件:行号 - 问题标题
-  风险：...
-  建议：...
-
-一致性复核：
-- 可评审性：通过 / 需拆分 / 有无关改动
-- PRD/需求一致性：通过 / 有偏差 / 缺少 PRD 依据
-- 方案/任务/SQL/接口一致性：通过 / 有偏差
-- 并行合并审查：未使用 / 通过 / 有问题
-- 幻觉审计：通过 / 有问题
-- 注释和日志链路：通过 / 有问题
-
-验证：
-- 已确认：...
-- 缺口：...
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow_cli.py" review-status \
+  --record <quick.md或05-implementation-log.md> [--require-passed]
 ```
 
-如果没有问题，明确写“未发现需要修改的问题”，并补充剩余风险或未覆盖验证。
+此后修改需求输入、实现证据、Review 报告、SQL、配置、代码或测试代码，旧 Review 都会失效；不要为回填字段修改已登记报告。
 
-## 硬约束
+## 门禁
 
-- 评审默认不改代码；用户要求修复时也必须先列问题和修复范围。
-- 不能只做代码规范 review；full 模式必须先对照 PRD/需求、baseline、research、design、tasks、SQL、接口文档和 diff 检查一致性，quick 模式必须先对照 `quick.md` 或用户确认边界、diff、代码事实和验证证据检查一致性。
-- 不能跳过幻觉审计。
-- 不能在 diff 混入多个无关需求、无关格式化或大面积历史清理时直接给通过结论。
-- 如果使用多 agent 并行实现，不能跳过 worker 文件锁、实际修改范围、同文件冲突和合并验证审查。
-- 不把无关历史问题当成本次必须修。
-- 不因为个人偏好要求大面积重构或格式化。
-- 不只说“建议优化”，必须说明风险和具体改法。
-- 没有文件和行号的问题，除全局验证缺口、文档缺口或发布风险外，不列为正式问题。
-- 不确定业务口径、接口契约、表结构或发布风险时，列为阻塞并向用户确认。
-- 影响 PRD/业务口径、接口契约、SQL、权限、状态隔离、数据一致性或旧链路副作用的无证据结论，必须列为阻塞。
-- worker 修改禁止文件、同文件多 worker 修改、契约未锁定两端并行改，必须列为阻塞。
-- 新增依赖、配置、MQ、Redis、ES、定时任务或安全敏感入口没有说明和验证时，不能直接通过。
-- 关键主链路无法定位业务实例身份、状态变化或外部调用结果时，不能直接通过。
-
-## 完成标准
-
-- 已覆盖本次相关 diff 和主链路。
-- 已建立逐文件改动清单，并确认无关改动、生成文件和格式化噪音不会影响评审结论。
-- full 模式已对照 PRD/需求原文、`00-baseline.md`、`01-research.md`、`02-design.md`、`03-tasks.md`、`04-schema.sql`、`interface-details/` 检查实现一致性；quick 模式已对照 `quick.md` 或用户确认边界、diff、代码事实和验证证据检查一致性。
-- 已完成幻觉审计，确认关键结论、实现范围和测试声明都有证据，或已按风险列为问题。
-- 如使用多 agent 并行实现，已检查 worker 文件锁、越界改动、同文件冲突、合并顺序和集成验证。
-- 已按 `references/code-review-quality-checklist.md` 补查代码质量、安全、注释日志、依赖配置和测试验证风险。
-- 已给出明确评审结论。
-- 如果存在需求目录，已更新 `06-code-review.md`，并新增本轮 `review-rounds/review-rNN.md`；多轮 review 没有覆盖历史结论。
-- 如果是 quick 模式且没有需求目录，已更新 `quick.md` 的 Review 结论，或在最终回复中说明无法落文件原因。
-- 用户可以据此决定修复、进入测试验证或返回编码实现。
+- `implementation-status` 成功，Review Package 完整且没有漏评 diff。
+- Gate A 先通过，Gate B 的核心面和所有触发模块均有独立证据。
+- 全部 CRxx 连续可追溯，阻塞/必须修问题已关闭。
+- `review-mark` 成功，结论绑定当前实现快照及两类 Review 指纹。

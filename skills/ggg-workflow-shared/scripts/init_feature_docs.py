@@ -8,6 +8,7 @@ import datetime as dt
 import json
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -24,7 +25,21 @@ def slugify(text: str) -> str:
 
 
 def detect_repo_root(explicit_repo_root: str | None) -> Path:
-    return Path(explicit_repo_root).resolve() if explicit_repo_root else Path.cwd().resolve()
+    if explicit_repo_root:
+        return Path(explicit_repo_root).resolve()
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=Path.cwd(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return Path.cwd().resolve()
+    if completed.returncode == 0 and completed.stdout.strip():
+        return Path(completed.stdout.strip()).resolve()
+    return Path.cwd().resolve()
 
 
 def detect_workflow_root(repo_root: Path) -> Path | None:
@@ -73,12 +88,14 @@ def sync_workflow_assets(repo_root: Path, overwrite: bool) -> tuple[Path, int, i
 
 def write_meta_json(target_dir: Path, feature_name: str) -> None:
     payload = {
+        "workflow_schema_version": 4,
         "feature_name": feature_name,
         "current_phase": "需求受理",
-        "current_status": "调研中",
+        "current_status": "待澄清",
         "primary_project": "",
-        "blocking_issue_count": 0,
         "gates": {
+            "clarification_required": True,
+            "clarification_confirmed": False,
             "alignment_completed": False,
             "design_confirmed": False,
             "tasks_confirmed": False,
@@ -88,6 +105,7 @@ def write_meta_json(target_dir: Path, feature_name: str) -> None:
             "release_ready": False,
             "business_model_confirmed": False,
             "upstream_contract_confirmed": False,
+            "schema_confirmed": False,
         },
         "review_flags": {
             "alignment_needs_review": False,
@@ -100,10 +118,17 @@ def write_meta_json(target_dir: Path, feature_name: str) -> None:
             "last_summary": "",
             "last_updated_at": "",
             "last_impacts": [],
+            "confirmed_baseline_sha256": "",
+            "baseline_confirmation_source": "",
+            "baseline_confirmed_at": "",
+        },
+        "schema_confirmation": {
+            "confirmed_schema_sha256": "",
+            "confirmation_source": "",
+            "confirmed_at": "",
         },
         "documents": {
             "baseline": "00-baseline.md",
-            "blocking_issues": "01-blocking-issues.md",
             "research": "01-research.md",
             "design": "02-design.md",
             "interface_details": "interface-details/",
@@ -119,7 +144,7 @@ def write_meta_json(target_dir: Path, feature_name: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="初始化需求文档目录")
-    parser.add_argument("--repo-root", help="仓库根目录，默认当前目录")
+    parser.add_argument("--repo-root", help="项目根目录；默认当前 Git 仓库根目录，非 Git 目录时使用当前目录")
     parser.add_argument("--feature-name", required=True, help="需求名称")
     parser.add_argument("--date", help="目录日期，默认今天，格式 YYYYMMDD")
     parser.add_argument("--refresh-workflow-assets", action="store_true", help="覆盖同步 ggg/workflow 下的共享 README 和模板")
@@ -127,7 +152,8 @@ def main() -> None:
 
     repo_root = detect_repo_root(args.repo_root)
     workflow_root, copied_count, skipped_count = sync_workflow_assets(repo_root, overwrite=args.refresh_workflow_assets)
-    templates_dir = workflow_root / "templates"
+    # 新需求固定使用当前 Skill 自带的最新 schema 模板，避免项目内旧模板与新版 meta 门禁不兼容。
+    templates_dir = Path(__file__).resolve().parent.parent / "assets" / "workflow" / "templates"
     features_dir = repo_root / "ggg" / "features"
     date_str = args.date or dt.date.today().strftime("%Y%m%d")
     target_dir = features_dir / f"{date_str}-{slugify(args.feature_name)}"

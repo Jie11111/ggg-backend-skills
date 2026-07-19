@@ -1,0 +1,4 @@
+interface:
+  display_name: "GGG Java Coding Standard"
+  short_description: "统一 Java 后端代码设计、实现、验证与评审共享规范"
+  default_prompt: "使用 $ggg-java-coding-standard 按统一规范设计并编写 Java 后端代码。"

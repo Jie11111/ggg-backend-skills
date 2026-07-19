@@ -1,4 +1,4 @@
 interface:
   display_name: "GGG Task Breakdown"
-  short_description: "任务拆分：按 L0/L1/L2 生成可执行后端任务清单"
-  default_prompt: "显式使用 $ggg-task-breakdown 基于已确认的 02-design.md、必要的 04-schema.sql 和 interface-details 生成 03-tasks.md；任务必须包含依赖、可并行组、初始状态、预计写入文件、输出物、完成标准、接口映射、风险映射和测试映射，并按 L0/L1/L2 判断并行等级：L0 写不并行原因，L1 写并行安全评估矩阵，L2 才写多 agent worker 分配表和文件锁。若方案未确认或门禁未满足，只返回缺口，不生成任务文档。"
+  short_description: "把已确认方案拆成纵向、轻量、可追溯且可直接编码的任务"
+  default_prompt: "使用 $ggg-task-breakdown，把已确认技术方案拆成纵向业务编码任务；跨项目分开、依赖无环，风险所需测试代码并入对应功能 Txx，完成标准写明最小验证，不生成测试执行或报告任务。"

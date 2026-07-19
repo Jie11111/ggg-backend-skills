@@ -9,6 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import workflow_validation as validator
+
 
 def file_status(path: Path) -> str:
     if not path.exists():
@@ -55,16 +57,23 @@ def main() -> None:
     print(f"[阶段] {meta.get('current_phase', '未知')}")
     print(f"[状态] {meta.get('current_status', '未知')}")
     print(f"[主项目] {meta.get('primary_project', '未设置')}")
-    print(f"[阻塞] {meta.get('blocking_issue_count', 0)} 个未解决")
-    print(f"[门禁] alignment={gate_label(gates.get('alignment_completed', False))} | "
+    research_path = feature_dir / "01-research.md"
+    unresolved = validator.unresolved_research_questions(research_path.read_text(encoding="utf-8")) if research_path.exists() else 0
+    if (feature_dir / "01-blocking-issues.md").exists():
+        unresolved += 1
+    print(f"[阻塞] {unresolved} 个未解决（从唯一疑问账本实时计算）")
+    print(f"[门禁] clarification={gate_label(gates.get('clarification_confirmed', False))} | "
+          f"alignment={gate_label(gates.get('alignment_completed', False))} | "
           f"design={gate_label(gates.get('design_confirmed', False))} | "
           f"tasks={gate_label(gates.get('tasks_confirmed', False))} | "
           f"implementation={gate_label(gates.get('implementation_completed', False))} | "
           f"review={gate_label(gates.get('review_passed', False))} | "
           f"test={gate_label(gates.get('test_passed', False))} | "
-          f"release={gate_label(gates.get('release_ready', False))} | "
           f"business_model={gate_label(gates.get('business_model_confirmed', False))} | "
           f"upstream_contract={gate_label(gates.get('upstream_contract_confirmed', False))}")
+    print(f"[SQL确认] {gate_label(gates.get('schema_confirmed', False))} | "
+          f"来源={meta.get('schema_confirmation', {}).get('confirmation_source', '') or '无'} | "
+          f"时间={meta.get('schema_confirmation', {}).get('confirmed_at', '') or '无'}")
 
     baseline = file_status(feature_dir / "00-baseline.md")
     research = file_status(feature_dir / "01-research.md")
