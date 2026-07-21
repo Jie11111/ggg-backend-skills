@@ -1,13 +1,13 @@
 ---
 name: ggg-requirement-alignment
-description: 需求对齐阶段。GGG 基于已确认的 `00-baseline.md`，用 CodeGraph、直接读代码和必要的运行证据验证主链路、数据承载、重试路径、复用边界、共享状态/枚举的生产消费影响面及跨项目依赖；技术事实由 AI 查证，业务意图不明时每次只问用户一个“当前疑问＋推荐理解”。所有阻塞统一进入 `01-research.md` 的 Qxx 疑问账本，清零且校验通过后才能进入技术方案。仅当用户明确指定 `$ggg-requirement-alignment`，或要求需求对齐、看代码确认、代码链路对齐、核查新增状态或枚举影响面时使用。
+description: 需求对齐阶段。GGG 基于已确认的 `00-baseline.md`，验证主链路、数据承载、重试路径、复用边界、共享状态/枚举影响面、跨项目依赖及新增或修改 SQL 的真实语义；技术事实由 AI 查证，业务意图不明时每次只问用户一个“当前疑问＋推荐理解”。所有阻塞统一进入 `01-research.md`，问题清零并完成用户 SQL 确认后才能进入技术方案。仅当用户明确指定 `$ggg-requirement-alignment`，或要求需求对齐、看代码确认、代码链路对齐、核查新增状态或枚举影响面时使用。
 ---
 
 # GGG Requirement Alignment（需求对齐）
 
 ## 目标和边界
 
-本阶段拿已确认的 `00-baseline.md` 验证真实代码，不重新发明需求，也不直接设计方案。最终回答五个问题：
+本阶段拿已确认的 `00-baseline.md` 验证真实代码，不重新发明需求，也不直接设计方案。最终回答：
 
 1. 用户闭环在现有系统中怎样运行。
 2. 业务事实、关联产物和状态由哪里承载。
@@ -15,6 +15,7 @@ description: 需求对齐阶段。GGG 基于已确认的 `00-baseline.md`，用 
 4. 哪些能力可复用、需改造、只能参考或禁止复用。
 5. 新增或变化的状态、枚举、类型码和字段语义被哪些场景生产、读取、过滤、统计或传播。
 6. 哪些结论已闭合，哪些非阻塞缺口留待后续验证。
+7. 本次是否新增或修改 SQL；若涉及，表、JOIN、过滤、排序、分页、写字段、更新条件和并发边界是什么。
 
 只看与需求直接相关的代码。可以按需读代码、SQL、配置、日志或接口结果，但禁止无边界全仓扫描，也不能把“看起来类似”写成正式结论。
 
@@ -180,6 +181,23 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow
 
 不适用跨项目依赖时在对应表中明确写“不涉及”及原因。
 
+### 6.1 识别并准备 SQL Gate
+
+沿真实调用链识别本次新增或修改的 `SELECT / INSERT / UPDATE / DELETE / DDL`，不能只检查表结构变化。把结论写入 `01-research.md` 的“SQL 影响与确认准备”：
+
+- SQL 影响类型：`不涉及 / 查询或DML / DDL`。
+- 表或对象、JOIN、过滤、排序、分页、插入/更新字段和更新条件。
+- 逻辑删除、租户、组织、权限条件、影响行数、并发和兼容边界。
+- 每行关联 Cxx/Exx；业务语义不清时进入 Qxx。
+
+调研完成后：
+
+- 不涉及 SQL：写明 Cxx 依据并执行 `confirm-sql` 记录“不涉及”。
+- 涉及 SQL：按模板创建 `sql-draft.sql`，写入供用户确认的精确 SQL 或 DDL，再执行 `confirm-sql` 锁定语义指纹。
+- SQL 尚未确认：保持在需求对齐阶段，不创建 `02-design.md`。
+
+SQL 中仅别名、空白、排版变化不改变语义；表、JOIN、字段、过滤、排序、分页、更新条件、事务或并发语义变化必须重新确认。
+
 ### 7. 维护唯一 Claim Ledger
 
 所有影响技术方案、SQL、接口、任务拆分或复用边界的关键判断，都只在 Claim Ledger 维护证据覆盖度、置信度和运行时缺口。Baseline 验证清单和第 3-7 节明细表只描述验证结果并引用 `Cxx`，不再复制一张覆盖度表或重复解释同一结论。
@@ -239,6 +257,8 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow
   sync-meta --feature-dir <需求目录>
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow_cli.py" \
   validate --feature-dir <需求目录>
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow_cli.py" \
+  confirm-sql --feature-dir <需求目录> --source <用户确认消息或时间>
 ```
 
 `validate` 是进入技术方案的统一门禁，必须同时保证：
@@ -251,10 +271,11 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow
 - Baseline 的全部 Bxx 已逐项验证；主链路和第 3～7 节没有空模板内容。
 - 共享语义影响判断已填写；涉及状态、枚举、类型码、业务阶段、场景标识或字段语义变化时，检索范围和消费场景矩阵已闭合。
 - Bxx、Cxx、Exx、Qxx 均无重复，Baseline 状态与关联 Claim 的证据等级、置信度和缺口一致。
+- SQL 影响已确认；涉及 SQL 时 `sql-draft.sql` 指纹有效，不涉及时有明确 Cxx 和用户确认来源。
 
 ## 硬约束
 
-- 禁止本阶段生成 `02-design.md`、`03-tasks.md` 或 `04-schema.sql`。
+- 禁止本阶段生成 `02-design.md` 或 `03-tasks.md`；允许且仅允许为 SQL Gate 创建 `sql-draft.sql`，不能借此提前编写完整技术方案。
 - 禁止跳过 baseline 验证清单，或只验证单个接口而不沿用户闭环检查数据承载、异步处理和重试。
 - 禁止在新增或修改共享状态、枚举、类型码、业务阶段、场景标识或字段语义时，只沿主入口调用链调研，或只搜索枚举类名后声称影响面已闭合。
 - 禁止无边界全仓扫描，禁止用扫描候选替代调用链证据，禁止输出配置值。
@@ -268,6 +289,7 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow
 ## 完成标准
 
 - `01-research.md` 能讲清主链路、数据身份、重试路径、旧链路副作用、复用边界和跨项目依赖。
+- SQL 影响已经明确；涉及 SQL 时 `sql-draft.sql` 已由用户确认并保持指纹有效，不涉及时也有确认来源。
 - 共享语义影响判断已收口；涉及共享状态或枚举变化时，生产方、载体、传播路径和所有已发现消费场景均已进入影响矩阵并引用 Cxx/Exx。
 - 每个关键判断进入唯一 Claim Ledger，并有可追溯的 `Cxx`、`Exx`、证据等级和置信度。
 - Baseline 的全部 Bxx 逐项验证；主链路和第 3-7 节有真实内容或“`不涉及：具体原因`”。

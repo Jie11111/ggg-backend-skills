@@ -64,28 +64,42 @@ def main() -> None:
         gates["alignment_completed"] = False
         gates["design_confirmed"] = False
         gates["schema_confirmed"] = False
+        gates["sql_confirmed"] = False
         confirmation = meta.setdefault("schema_confirmation", {})
         confirmation["confirmed_schema_sha256"] = ""
         confirmation["confirmation_source"] = ""
         confirmation["confirmed_at"] = ""
+        sql_confirmation = meta.setdefault("sql_confirmation", {})
+        for key in [
+            "impact_type",
+            "research_semantic_fingerprint",
+            "draft_semantic_fingerprint",
+            "semantic_fingerprint",
+            "confirmation_source",
+            "confirmed_at",
+        ]:
+            sql_confirmation[key] = ""
     if target_idx < PUBLIC_PHASES.index("任务拆分"):
         gates["design_confirmed"] = False
         gates["tasks_confirmed"] = False
     if target_idx < PUBLIC_PHASES.index("编码实现"):
         gates["tasks_confirmed"] = False
         gates["implementation_completed"] = False
-        gates["review_passed"] = False
         gates["test_passed"] = False
         gates["release_ready"] = False
     if target_idx < PUBLIC_PHASES.index("代码检查"):
         gates["implementation_completed"] = False
-        gates["review_passed"] = False
         gates["test_passed"] = False
         gates["release_ready"] = False
     if target_idx < PUBLIC_PHASES.index("测试验证"):
-        gates["review_passed"] = False
         gates["test_passed"] = False
         gates["release_ready"] = False
+
+    gates.pop("review_passed", None)
+    gates.pop("review_gate_satisfied", None)
+    meta.pop("review_disposition", None)
+    if target_idx < PUBLIC_PHASES.index("代码检查"):
+        meta["review_status"] = "not_run"
     if target_idx < PUBLIC_PHASES.index("交付完成"):
         gates["test_passed"] = False
         gates["release_ready"] = False

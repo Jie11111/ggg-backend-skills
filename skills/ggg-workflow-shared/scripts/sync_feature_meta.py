@@ -11,7 +11,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import workflow_validation as validator
-from sync_clarification_impact import phase_reached, reopen_baseline_confirmation, reset_from_baseline
+import implementation_session
+from sync_clarification_impact import (
+    phase_reached,
+    reopen_baseline_confirmation,
+    reset_from_baseline,
+    reset_sql_confirmation,
+)
 
 
 def load_json(path: Path) -> dict:
@@ -46,12 +52,12 @@ def main() -> None:
         "design_confirmed",
         "tasks_confirmed",
         "implementation_completed",
-        "review_passed",
         "test_passed",
         "release_ready",
         "business_model_confirmed",
         "upstream_contract_confirmed",
         "schema_confirmed",
+        "sql_confirmed",
     ]:
         gates.setdefault(key, False)
     if int(meta.get("workflow_schema_version", 1)) >= 3:
@@ -94,6 +100,17 @@ def main() -> None:
             gates["design_confirmed"] = False
             review_flags["design_needs_review"] = True
 
+    sql_confirmation = meta.setdefault("sql_confirmation", {})
+    for key in [
+        "impact_type",
+        "research_semantic_fingerprint",
+        "draft_semantic_fingerprint",
+        "semantic_fingerprint",
+        "confirmation_source",
+        "confirmed_at",
+    ]:
+        sql_confirmation.setdefault(key, "")
+
     clarification_required = bool(gates.get("clarification_required", False))
     baseline_path = feature_dir / "00-baseline.md"
     baseline_text = validator.read_text(baseline_path)
@@ -111,6 +128,7 @@ def main() -> None:
         schema_confirmation["confirmed_schema_sha256"] = ""
         schema_confirmation["confirmation_source"] = ""
         schema_confirmation["confirmed_at"] = ""
+        reset_sql_confirmation(meta, gates)
         reopen_baseline_confirmation(baseline_path)
         meta["current_status"] = "待澄清"
         if phase_reached(phase, "需求对齐"):
@@ -132,7 +150,31 @@ def main() -> None:
             and current_fingerprint == confirmed_fingerprint
         )
     research_text = validator.read_text(feature_dir / "01-research.md")
+    if (
+        int(meta.get("workflow_schema_version", 1)) >= 5
+        and research_text
+        and gates.get("sql_confirmed")
+    ):
+        sql_gate_errors = validator.validate_sql_gate_binding(
+            feature_dir,
+            meta,
+            research_text,
+            validator.extract_claim_ids_from_research(research_text),
+        )
+        if sql_gate_errors:
+            reset_sql_confirmation(meta, gates)
+            gates["design_confirmed"] = False
+            gates["tasks_confirmed"] = False
+            gates["implementation_completed"] = False
+            meta["review_status"] = "stale"
+            gates["test_passed"] = False
+            review_flags["design_needs_review"] = True
+            meta["current_status"] = "待重审"
     research_ready = not validator.validate_research_doc(feature_dir / "01-research.md")
+    sql_ready = (
+        int(meta.get("workflow_schema_version", 1)) < 5
+        or bool(gates.get("sql_confirmed"))
+    )
     design_ready = not validator.validate_design_doc(
         feature_dir / "02-design.md",
         feature_dir / "interface-details",
@@ -145,7 +187,35 @@ def main() -> None:
     code_review = feature_dir / "06-code-review.md"
     test_report = feature_dir / "07-test-report.md"
     implementation_ready = implementation_log.exists() and not validator.validate_implementation_log(implementation_log)
-    review_ready = code_review.exists() and not validator.validate_code_review_artifacts(code_review, feature_dir / "review-rounds")
+    implementation_state = None
+    review_status = str(meta.get("review_status", "not_run"))
+    state_file = feature_dir / "implementation-state.json"
+    if implementation_log.exists() and state_file.exists():
+        implementation_state = implementation_session.load_state(implementation_log)
+        review_state = implementation_state.get("review") or {}
+        if review_state:
+            current_snapshot = implementation_session.current_snapshot(implementation_state)
+            review_binding_errors = implementation_session.current_review_binding_errors(
+                implementation_log,
+                implementation_state,
+                current_snapshot,
+            )
+            if not review_binding_errors:
+                review_status = str(review_state.get("result", "not_run"))
+                if review_status == "skipped":
+                    review_status = "not_run"
+            else:
+                review_status = "stale"
+        else:
+            review_status = "not_run"
+    gates.pop("review_passed", None)
+    gates.pop("review_gate_satisfied", None)
+    meta.pop("review_disposition", None)
+    meta["review_status"] = review_status
+    review_ready = code_review.exists() and not validator.validate_code_review_artifacts(
+        code_review,
+        feature_dir / "review-rounds",
+    )
     test_ready = test_report.exists() and not validator.validate_test_report_artifacts(test_report, feature_dir / "test-rounds")
     validator.sync_primary_project_from_baseline(meta, feature_dir / "00-baseline.md")
 
@@ -157,7 +227,11 @@ def main() -> None:
     elif phase == "需求受理":
         meta["current_status"] = "已确认" if gates.get("clarification_confirmed") else "待澄清"
     elif phase == "需求对齐":
-        meta["current_status"] = "已对齐" if baseline_ready and research_ready and unresolved == 0 else "调研中"
+        meta["current_status"] = (
+            "已对齐"
+            if baseline_ready and research_ready and sql_ready and unresolved == 0
+            else "调研中"
+        )
         gates["alignment_completed"] = meta["current_status"] == "已对齐"
         if gates["alignment_completed"]:
             review_flags["alignment_needs_review"] = False
@@ -172,8 +246,12 @@ def main() -> None:
         else:
             meta["current_status"] = "编码中" if implementation_ready else "待编码"
     elif phase == "代码检查":
-        if gates.get("review_passed"):
-            meta["current_status"] = "已通过"
+        if review_status == "passed":
+            meta["current_status"] = "已检查"
+        elif review_status == "needs_changes":
+            meta["current_status"] = "发现问题"
+        elif review_status == "blocked":
+            meta["current_status"] = "检查阻塞"
         else:
             meta["current_status"] = "检查中" if review_ready else "待检查"
     elif phase == "测试验证":

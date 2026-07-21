@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -23,6 +24,8 @@ import workflow_validation as validator
 
 
 STATE_FILE = "implementation-state.json"
+STATE_SCHEMA_VERSION = 11
+REVIEW_DISPOSITIONS = {"light", "formal", "skipped"}
 DOCUMENT_SUFFIXES = {".md", ".rst", ".adoc"}
 PRECHECK_ROWS = """| 轮次 | 检查面 | 预检结论 | 事实依据 | 状态 |
 |---|---|---|---|---|
@@ -123,13 +126,59 @@ def load_state(record: Path) -> dict:
     path = state_path(record)
     if not path.exists():
         raise SystemExit(f"缺少实现会话状态: {path}。编码前必须先执行 implementation-start")
-    return json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads(path.read_text(encoding="utf-8"))
+    normalize_legacy_review_state(state)
+    return state
 
 
 def save_state(record: Path, state: dict) -> None:
+    state["schema_version"] = max(
+        int(state.get("schema_version", 1)),
+        STATE_SCHEMA_VERSION,
+    )
+    normalize_legacy_review_state(state)
     atomic_write_text(
         state_path(record),
         json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def normalize_legacy_review_state(state: dict) -> None:
+    """给旧状态补出 disposition/gate 语义，但不把 skipped 冒充 passed。"""
+    review = state.get("review")
+    if not isinstance(review, dict) or not review:
+        return
+    if review.get("model") == "optional":
+        review["passed"] = review.get("result") == "passed"
+        return
+    disposition = review.get("disposition")
+    if disposition not in REVIEW_DISPOSITIONS:
+        disposition = "formal"
+        review["disposition"] = disposition
+    result = review.get("result")
+    review["passed"] = bool(result == "passed" and disposition != "skipped")
+    review["gate_satisfied"] = bool(
+        review["passed"] or (disposition == "skipped" and result == "skipped")
+    )
+
+
+def review_disposition(review: dict) -> str:
+    disposition = review.get("disposition")
+    return disposition if disposition in REVIEW_DISPOSITIONS else "formal"
+
+
+def review_gate_satisfied(review: dict) -> bool:
+    disposition = review_disposition(review)
+    return bool(
+        (disposition in {"light", "formal"} and review.get("result") == "passed")
+        or (disposition == "skipped" and review.get("result") == "skipped")
+    )
+
+
+def review_passed(review: dict) -> bool:
+    return bool(
+        review_disposition(review) in {"light", "formal"}
+        and review.get("result") == "passed"
     )
 
 
@@ -261,6 +310,86 @@ def ensure_precheck_record_structure(record: Path) -> None:
         missing_lines = [prefix for prefix in required_fields if prefix not in text]
         text = text.replace(state_line, state_line + "\n" + "\n".join(missing_lines), 1)
     atomic_write_text(record, text)
+    ensure_review_record_fields(record)
+
+
+def is_quick_v3_record(record: Path, text: str | None = None) -> bool:
+    """识别使用中文简洁 Review 字段的 quick v3 记录。"""
+    if record.name != "quick.md":
+        return False
+    content = text if text is not None else record.read_text(encoding="utf-8")
+    return validator.quick_schema_version(content) >= 3
+
+
+def is_optional_review_record(record: Path, text: str | None = None) -> bool:
+    content = text if text is not None else record.read_text(encoding="utf-8")
+    if record.name == "quick.md":
+        return validator.quick_schema_version(content) >= 4
+    if record.name == "05-implementation-log.md":
+        return validator.implementation_schema_version(content) >= 3
+    if record.name == "06-code-review.md":
+        return validator.review_schema_version(content) >= 2
+    return False
+
+
+def review_record_field_prefixes(
+    record: Path,
+    text: str | None = None,
+) -> dict[str, str]:
+    """返回当前记录 schema 的 Review 状态字段，兼容旧记录而不重复造字段。"""
+    if is_optional_review_record(record, text):
+        return {
+            "status": "- Review 状态：",
+            "result": "- Review 结论：",
+            "implementation_round": "- Review 对应实现轮次：",
+            "fingerprint": "- Review 对应差异指纹：",
+        }
+    if record.name == "06-code-review.md":
+        return {
+            "result": "- 当前结论：",
+            "disposition": "- Review disposition：",
+            "gate_satisfied": "- Review 门禁是否满足：",
+            "skip_reason": "- Review 跳过原因：",
+            "implementation_round": "- 对应实现轮次：",
+            "fingerprint": "- 实现差异指纹：",
+        }
+    if is_quick_v3_record(record, text):
+        return {
+            "result": "- Review 结论：",
+            "disposition": "- Review 处置：",
+            "gate_satisfied": "- Review Gate 是否满足：",
+            "skip_reason": "- Review 跳过来源：",
+            "implementation_round": "- Review 对应实现轮次：",
+            "fingerprint": "- Review 对应差异指纹：",
+        }
+    return {
+        "result": "- Review 结论：",
+        "disposition": "- Review disposition：",
+        "gate_satisfied": "- Review 门禁是否满足：",
+        "skip_reason": "- Review 跳过原因：",
+        "implementation_round": "- Review 对应实现轮次：",
+        "fingerprint": "- Review 对应差异指纹：",
+    }
+
+
+def ensure_review_record_fields(record: Path) -> None:
+    """给旧实现记录补齐 disposition 与门禁字段。"""
+    text = record.read_text(encoding="utf-8")
+    if is_optional_review_record(record, text):
+        return
+    if not any(
+        line.strip().startswith("- Review 结论：")
+        for line in text.splitlines()
+    ):
+        return
+    if is_quick_v3_record(record, text):
+        return
+    for prefix, value, anchor in [
+        ("- Review disposition：", "未执行", "- Review 结论："),
+        ("- Review 门禁是否满足：", "否", "- Review disposition："),
+        ("- Review 跳过原因：", "", "- Review 门禁是否满足："),
+    ]:
+        upsert_record_line_after(record, prefix, value, anchor)
 
 
 def prepare_precheck_round_rows(record: Path, round_id: str, risk_profile: str) -> None:
@@ -294,6 +423,7 @@ def prepare_precheck_round_rows(record: Path, round_id: str, risk_profile: str) 
 def validate_record_state_fields(record: Path) -> None:
     """在保存会话状态前确认模板可承载全部实现与 Review 状态。"""
     text = record.read_text(encoding="utf-8")
+    review_fields = review_record_field_prefixes(record, text)
     required = [
         "- 实现状态：",
         "- 当前实现轮次：",
@@ -303,10 +433,20 @@ def validate_record_state_fields(record: Path) -> None:
         "- 预检记录指纹：",
         "- 涉及 Git 仓库及编码基线：",
         "- 最终差异指纹：",
-        "- Review 结论：",
-        "- Review 对应实现轮次：",
-        "- Review 对应差异指纹：",
+        review_fields["result"],
+        review_fields["implementation_round"],
+        review_fields["fingerprint"],
     ]
+    if is_optional_review_record(record, text):
+        required.append(review_fields["status"])
+    else:
+        required.extend(
+            [
+                review_fields["disposition"],
+                review_fields["gate_satisfied"],
+                review_fields["skip_reason"],
+            ]
+        )
     missing = [prefix for prefix in required if not any(line.strip().startswith(prefix) for line in text.splitlines())]
     if missing:
         raise SystemExit("记录模板缺少实现会话字段: " + ", ".join(missing))
@@ -373,6 +513,92 @@ def initial_dirty_snapshot(repo: Path) -> dict[str, dict[str, str]]:
             result[old_relative] = {"status": status_code, **file_snapshot(repo / old_relative)}
         result[relative] = {"status": status_code, **file_snapshot(repo / relative)}
     return result
+
+
+def resolve_commit(repo: Path, revision: str, label: str) -> str:
+    revision = revision.strip()
+    if not revision:
+        raise SystemExit(f"{label} 不能为空")
+    resolved = run_git(
+        repo,
+        "rev-parse",
+        "--verify",
+        f"{revision}^{{commit}}",
+        check=False,
+    )
+    if not re.fullmatch(r"[0-9a-f]{40,64}", resolved):
+        raise SystemExit(f"{label} 不是有效提交: {revision}")
+    return resolved
+
+
+def committed_diff_paths(repo: Path, base: str, target: str) -> list[str]:
+    output = run_git_bytes(
+        repo,
+        "diff",
+        "--name-only",
+        "-z",
+        "--diff-filter=ACMRD",
+        base,
+        target,
+        "--",
+    )
+    return sorted(
+        decode_git_path(value)
+        for value in output.split(b"\0")
+        if value
+    )
+
+
+def resolve_committed_diff_sources(
+    repo_states: list[dict],
+    diff_ranges: list[str],
+    adopted_commits: list[str],
+) -> None:
+    """把已提交差异绑定到仓库；多仓按 --repo-root 顺序各提供一个值。"""
+    if diff_ranges and adopted_commits:
+        raise SystemExit("--diff-range 与 --adopt-commit 不能在同一实现轮次混用")
+    values = diff_ranges or adopted_commits
+    if not values:
+        return
+    if len(values) != len(repo_states):
+        if len(repo_states) == 1:
+            raise SystemExit("单仓实现只能提供一个 --diff-range 或 --adopt-commit")
+        raise SystemExit("多仓实现必须按 --repo-root 顺序为每个仓库提供一个已提交差异")
+
+    source_kind = "diff-range" if diff_ranges else "adopt-commit"
+    for repo_state, value in zip(repo_states, values):
+        repo = Path(repo_state["root"])
+        if source_kind == "diff-range":
+            if "..." in value or value.count("..") != 1:
+                raise SystemExit("--diff-range 必须使用 <base>..<target>，不支持三点范围")
+            base_expression, target_expression = value.split("..", 1)
+            base = resolve_commit(repo, base_expression, "--diff-range base")
+            target = resolve_commit(repo, target_expression, "--diff-range target")
+        else:
+            target = resolve_commit(repo, value, "--adopt-commit")
+            base = resolve_commit(repo, f"{target}^", "--adopt-commit 父提交")
+
+        ancestor = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", target, "HEAD"],
+            check=False,
+            capture_output=True,
+        )
+        if ancestor.returncode != 0:
+            raise SystemExit(
+                f"已提交差异目标 {target[:12]} 不在当前 HEAD 历史中；"
+                "请先切换到包含该提交的分支"
+            )
+        paths = committed_diff_paths(repo, base, target)
+        if not paths:
+            raise SystemExit(f"已提交差异 {base[:12]}..{target[:12]} 没有文件变化")
+        repo_state["diff_source"] = {
+            "type": source_kind,
+            "base": base,
+            "target": target,
+            "requested": value,
+        }
+        repo_state["committed_diff_paths"] = paths
+        repo_state["round_adopted_committed"] = paths
 
 
 def resolve_adopted_existing_files(
@@ -456,6 +682,10 @@ def inherited_previous_files(previous: dict, repo_states: list[dict]) -> dict[st
 
 
 def changed_paths(repo_state: dict) -> set[str]:
+    committed_paths = set(repo_state.get("committed_diff_paths", []))
+    if committed_paths:
+        return committed_paths | set(repo_state.get("adopted_existing", []))
+
     repo = Path(repo_state["root"])
     base_head = repo_state["base_head"]
     paths: set[str] = set()
@@ -526,6 +756,10 @@ def collect_changes(state: dict) -> tuple[set[str], dict[str, list[str]]]:
 
 def current_snapshot(state: dict) -> dict:
     include_mode = int(state.get("schema_version", 2)) >= 3
+    include_source = any(
+        repository.get("diff_source")
+        for repository in state.get("repositories", [])
+    )
     repositories = []
     for repo_state in state["repositories"]:
         repo = Path(repo_state["root"])
@@ -545,16 +779,23 @@ def current_snapshot(state: dict) -> dict:
             {
                 "label": repo_state["label"],
                 "head": run_git(repo, "rev-parse", "HEAD"),
+                "source": repo_state.get("diff_source", {"type": "worktree"}),
                 "files": entries,
             }
         )
     payload = {"repositories": repositories}
-    fingerprint_payload = {
-        "repositories": [
-            {"label": item["label"], "files": item["files"]}
-            for item in repositories
-        ]
-    }
+    fingerprint_payload = {"repositories": []}
+    for item in repositories:
+        fingerprint_repository = {
+            "label": item["label"],
+            "files": item["files"],
+        }
+        if include_source:
+            fingerprint_repository["source"] = item.get(
+                "source",
+                {"type": "worktree"},
+            )
+        fingerprint_payload["repositories"].append(fingerprint_repository)
     encoded = json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     payload["fingerprint"] = hashlib.sha256(encoded).hexdigest()
     return payload
@@ -600,6 +841,9 @@ def current_round_paths(state: dict, current: dict) -> set[str]:
             )
         )
         for path in explicitly_adopted:
+            if is_state_quality_file(state, repository, path):
+                changed.add((label, path))
+        for path in repository.get("round_adopted_committed", []):
             if is_state_quality_file(state, repository, path):
                 changed.add((label, path))
     return {
@@ -761,6 +1005,9 @@ def next_round_number(record: Path, previous: dict) -> int:
 
 def update_active_round_record(record: Path, state: dict, baselines: str | None = None) -> None:
     """统一重置新一轮实现记录，避免 start/restart 状态语义漂移。"""
+    review_fields = review_record_field_prefixes(record)
+    quick_v3 = is_quick_v3_record(record)
+    optional_review = is_optional_review_record(record)
     update_record_line(record, "- 实现状态：", "编码中")
     update_record_line(record, "- 当前实现轮次：", state["round"])
     update_record_line(record, "- 风险级别：", state["risk_profile"])
@@ -770,22 +1017,34 @@ def update_active_round_record(record: Path, state: dict, baselines: str | None 
     if baselines is not None:
         update_record_line(record, "- 涉及 Git 仓库及编码基线：", baselines)
     update_record_line(record, "- 最终差异指纹：", "")
-    update_record_line(record, "- Review 结论：", "未执行")
-    update_record_line(record, "- Review 对应实现轮次：", "")
-    update_record_line(record, "- Review 对应差异指纹：", "")
+    if optional_review:
+        update_record_line(record, review_fields["status"], "未执行")
+        update_record_line(record, review_fields["result"], "未执行")
+    else:
+        update_record_line(record, review_fields["result"], "未执行")
+        update_record_line(record, review_fields["disposition"], "未执行")
+        update_record_line(record, review_fields["gate_satisfied"], "否")
+        update_record_line(
+            record,
+            review_fields["skip_reason"],
+            "不涉及" if quick_v3 else "",
+        )
+    update_record_line(record, review_fields["implementation_round"], "")
+    update_record_line(record, review_fields["fingerprint"], "")
     if record.name == "quick.md":
-        upsert_record_line_after(
-            record,
-            "- Review 方式：",
-            "未执行",
-            "- Review 结论：",
-        )
-        upsert_record_line_after(
-            record,
-            "- Self-review 原因：",
-            "",
-            "- Review 方式：",
-        )
+        if not quick_v3 and not optional_review:
+            upsert_record_line_after(
+                record,
+                "- Review 方式：",
+                "未执行",
+                "- Review 结论：",
+            )
+            upsert_record_line_after(
+                record,
+                "- Self-review 原因：",
+                "",
+                "- Review 方式：",
+            )
         quick_text = record.read_text(encoding="utf-8")
         for prefix, value in [
             ("- Review Gate A：", "未执行"),
@@ -866,6 +1125,11 @@ def command_start(args: argparse.Namespace) -> None:
                 "initial_dirty": initial_dirty_snapshot(repo),
             }
         )
+    resolve_committed_diff_sources(
+        repo_states,
+        list(getattr(args, "diff_range", []) or []),
+        list(getattr(args, "adopt_commit", []) or []),
+    )
     adopted_by_root = resolve_adopted_existing_files(
         repo_states,
         args.adopt_existing_file,
@@ -882,7 +1146,7 @@ def command_start(args: argparse.Namespace) -> None:
         )
 
     state = {
-        "schema_version": 7,
+        "schema_version": STATE_SCHEMA_VERSION,
         "record": str(record),
         "round": round_id,
         "status": "in_progress",
@@ -906,7 +1170,14 @@ def command_start(args: argparse.Namespace) -> None:
     state["start_snapshot"] = current_snapshot(state)
     save_state(record, state)
     baselines = "；".join(
-        f"{item['label']}@{item['base_head']} ({item['root']})"
+        (
+            f"{item['label']}@{item['base_head']} ({item['root']})"
+            if not item.get("diff_source")
+            else (
+                f"{item['label']}@{item['diff_source']['base'][:12]}"
+                f"..{item['diff_source']['target'][:12]} ({item['root']})"
+            )
+        )
         for item in repo_states
     )
     update_active_round_record(record, state, baselines)
@@ -940,7 +1211,10 @@ def command_restart(args: argparse.Namespace) -> None:
 
     previous_round = state.get("round", "")
     normalized_state = dict(state)
-    normalized_state["schema_version"] = 7
+    normalized_state["schema_version"] = max(
+        int(state.get("schema_version", 1)),
+        STATE_SCHEMA_VERSION,
+    )
     snapshot = current_snapshot(normalized_state)
     history = list(state.get("superseded_rounds", []))
     history.append(
@@ -957,7 +1231,10 @@ def command_restart(args: argparse.Namespace) -> None:
     prepare_precheck_round_rows(record, round_id, risk_profile)
     state.update(
         {
-            "schema_version": 7,
+            "schema_version": max(
+                int(state.get("schema_version", 1)),
+                STATE_SCHEMA_VERSION,
+            ),
             "round": round_id,
             "status": "in_progress",
             "risk_profile": risk_profile,
@@ -976,6 +1253,9 @@ def command_restart(args: argparse.Namespace) -> None:
     )
     for repository in state.get("repositories", []):
         repository["round_adopted_existing"] = []
+        repository["round_adopted_committed"] = list(
+            repository.get("committed_diff_paths", [])
+        )
     save_state(record, state)
     update_active_round_record(record, state)
     print(f"[OK] 已废弃实现轮次 {previous_round} 并开启 {round_id}")
@@ -1110,7 +1390,7 @@ def record_verification_waiver(record: Path, round_id: str, reason: str) -> None
 
 
 def command_verify(args: argparse.Namespace) -> None:
-    """执行无 shell 的验证命令，并将结果绑定到执行前后的代码快照。"""
+    """以一次性非 PTY 进程执行验证，并绑定代码快照和回收事实。"""
     record = Path(args.record).resolve()
     state = load_state(record)
     if state.get("status") != "in_progress":
@@ -1127,22 +1407,37 @@ def command_verify(args: argparse.Namespace) -> None:
         command = command[1:]
     if not command:
         raise SystemExit("implementation-verify 必须在 -- 后提供验证命令")
+    if args.timeout_seconds < 1 or args.timeout_seconds > 3600:
+        raise SystemExit("--timeout-seconds 必须在 1 到 3600 之间")
 
     cwd = verification_cwd(state, args.cwd)
     before = current_snapshot(state)
     started_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     environment_blocked = False
+    timed_out = False
+    residual_processes_detected = False
+    term_sent = False
+    kill_sent = False
+    residual_processes_after_cleanup = False
     try:
-        completed = subprocess.run(command, cwd=cwd, check=False, capture_output=True)
-        exit_code = completed.returncode
-        stdout = completed.stdout
-        stderr = completed.stderr
+        (
+            exit_code,
+            stdout,
+            stderr,
+            timed_out,
+            residual_processes_detected,
+            term_sent,
+            kill_sent,
+            residual_processes_after_cleanup,
+        ) = run_test_command_once(command, cwd, args.timeout_seconds)
     except OSError as error:
         environment_blocked = True
         exit_code = 127
         stdout = b""
         stderr = str(error).encode("utf-8", errors="replace")
     after = current_snapshot(state)
+    redacted_command = redact_test_argv(command)
+    sensitive_command_values = sensitive_test_argv_values(command)
     runs = list(state.get("verification_runs", []))
     run_id = f"V{len(runs) + 1}"
     result = (
@@ -1150,6 +1445,8 @@ def command_verify(args: argparse.Namespace) -> None:
         if before["fingerprint"] != after["fingerprint"]
         else "environment_blocked"
         if environment_blocked
+        else "failed"
+        if timed_out or residual_processes_after_cleanup
         else "passed"
         if exit_code == 0
         else "failed"
@@ -1158,11 +1455,18 @@ def command_verify(args: argparse.Namespace) -> None:
         "id": run_id,
         "implementation_round": state.get("round"),
         "label": args.label.strip() if args.label else "",
-        "command": command,
+        "command": redacted_command,
         "cwd": str(cwd),
         "started_at": started_at,
         "completed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "execution_mode": "one-shot non-PTY",
+        "timeout_seconds": args.timeout_seconds,
         "exit_code": exit_code,
+        "timed_out": timed_out,
+        "residual_processes_detected": residual_processes_detected,
+        "process_group_term_sent": term_sent,
+        "process_group_kill_sent": kill_sent,
+        "residual_processes_after_cleanup": residual_processes_after_cleanup,
         "stdout_sha256": output_digest(stdout),
         "stderr_sha256": output_digest(stderr),
         "before_snapshot_fingerprint": before["fingerprint"],
@@ -1175,20 +1479,34 @@ def command_verify(args: argparse.Namespace) -> None:
     save_state(record, state)
     record_verification_result(record, run)
 
-    if stdout:
-        sys.stdout.write(stdout.decode("utf-8", errors="replace"))
-        if not stdout.endswith(b"\n"):
+    redacted_stdout = redact_test_output(
+        stdout,
+        sensitive_values=sensitive_command_values,
+    )["summary"]
+    redacted_stderr = redact_test_output(
+        stderr,
+        sensitive_values=sensitive_command_values,
+    )["summary"]
+    if redacted_stdout:
+        sys.stdout.write(redacted_stdout)
+        if not redacted_stdout.endswith("\n"):
             sys.stdout.write("\n")
-    if stderr:
-        sys.stderr.write(stderr.decode("utf-8", errors="replace"))
-        if not stderr.endswith(b"\n"):
+    if redacted_stderr:
+        sys.stderr.write(redacted_stderr)
+        if not redacted_stderr.endswith("\n"):
             sys.stderr.write("\n")
     outcome = "OK" if result == "passed" else "BLOCKED" if result == "environment_blocked" else "FAIL"
     print(f"[{outcome}] {run_id} 验证结果: {result}")
-    print(f"- 命令: {shlex.join(command)}")
+    print(f"- 命令: {shlex.join(redacted_command)}")
     print(f"- 代码快照: {after['fingerprint']}")
     print(f"- stdout SHA256: {run['stdout_sha256']}")
     print(f"- stderr SHA256: {run['stderr_sha256']}")
+    print(
+        "- 进程回收: "
+        f"timeout={timed_out}, residual_detected={residual_processes_detected}, "
+        f"term={term_sent}, kill={kill_sent}, "
+        f"residual_after_cleanup={residual_processes_after_cleanup}"
+    )
     if result == "stale":
         print("- 验证命令改变了实现文件；请确认生成结果后重新执行验证")
     if result != "passed":
@@ -1400,7 +1718,10 @@ def fingerprint_entries(entries: list[tuple[str, bytes]]) -> str:
     return digest.hexdigest()
 
 
-def review_artifact_fingerprint(record: Path) -> str:
+def review_artifact_fingerprint(
+    record: Path,
+    include_disposition_fields: bool = True,
+) -> str:
     """只锁定 Review 工件，避免 quick 后续测试字段让 Review 自行失效。"""
     if record.name != "quick.md":
         entries = [
@@ -1421,6 +1742,42 @@ def review_artifact_fingerprint(record: Path) -> str:
         return fingerprint_entries(entries)
 
     text = record.read_text(encoding="utf-8")
+    if is_quick_v3_record(record, text):
+        fields = review_record_field_prefixes(record, text)
+        labels = [
+            fields["result"],
+            fields["implementation_round"],
+            fields["fingerprint"],
+            "- Light Review 简要结论：",
+            "- Review 未关闭阻塞/必须修问题：",
+            "- Review 剩余风险：",
+        ]
+        if include_disposition_fields:
+            labels[1:1] = [
+                fields["disposition"],
+                fields["gate_satisfied"],
+                fields["skip_reason"],
+            ]
+        values = "\n".join(
+            f"{label}{validator.extract_line_value(text, label)}"
+            for label in labels
+        )
+        section = (
+            validator.extract_section(
+                text,
+                "### 5.1 Formal Review 两门复核（仅 formal）",
+            )
+            if validator.extract_line_value(
+                text,
+                fields["disposition"],
+            ).strip()
+            == "formal"
+            else ""
+        )
+        return fingerprint_entries(
+            [("quick-review", f"{values}\n{section}".encode("utf-8"))]
+        )
+
     new_format = "### 5.1 Quick Review 两门复核" in text
     labels = (
         [
@@ -1446,6 +1803,12 @@ def review_artifact_fingerprint(record: Path) -> str:
             "- Review SQL/DDL 规范证据：",
         ]
     )
+    if include_disposition_fields:
+        labels[1:1] = [
+            "- Review disposition：",
+            "- Review 门禁是否满足：",
+            "- Review 跳过原因：",
+        ]
     values = "\n".join(
         f"{label}{validator.extract_line_value(text, label)}"
         for label in labels
@@ -1459,9 +1822,41 @@ def review_artifact_fingerprint(record: Path) -> str:
     return fingerprint_entries([("quick-review", f"{values}\n{section}".encode("utf-8"))])
 
 
-def review_input_fingerprint(record: Path, code_fingerprint: str) -> str:
+def review_skip_decision_fingerprint(record: Path) -> str:
+    """只锁定跳过决定，不要求伪造 Review 轮次或报告。"""
+    entries: list[tuple[str, bytes]] = []
+    for path in [record, record.parent / "06-code-review.md"]:
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        fields = review_record_field_prefixes(path, text)
+        labels = [
+            fields["result"],
+            fields["disposition"],
+            fields["gate_satisfied"],
+            fields["skip_reason"],
+            fields["implementation_round"],
+            fields["fingerprint"],
+        ]
+        values = "\n".join(
+            f"{label}{validator.extract_line_value(text, label)}"
+            for label in labels
+        )
+        entries.append((path.name, values.encode("utf-8")))
+    return fingerprint_entries(entries)
+
+
+def review_input_fingerprint(
+    record: Path,
+    code_fingerprint: str,
+    disposition: str = "formal",
+) -> str:
     """锁定 Review 所依据的需求、方案、任务、契约与实现差异。"""
-    entries: list[tuple[str, bytes]] = [("code-fingerprint", code_fingerprint.encode("utf-8"))]
+    entries: list[tuple[str, bytes]] = [
+        ("code-fingerprint", code_fingerprint.encode("utf-8")),
+    ]
+    if disposition != "legacy":
+        entries.append(("review-disposition", disposition.encode("utf-8")))
     if record.name == "quick.md":
         text = record.read_text(encoding="utf-8")
         for heading in [
@@ -1489,13 +1884,25 @@ def review_input_fingerprint(record: Path, code_fingerprint: str) -> str:
             entries.append(("interface-details/", b"<missing>"))
         return fingerprint_entries(entries)
 
-    for name in [
-        "00-baseline.md",
-        "01-research.md",
-        "02-design.md",
-        "03-tasks.md",
-        "04-schema.sql",
-    ]:
+    input_names = (
+        [
+            "00-baseline.md",
+            "02-design.md",
+            "03-tasks.md",
+            "sql-draft.sql",
+            "04-schema.sql",
+        ]
+        if disposition == "light"
+        else [
+            "00-baseline.md",
+            "01-research.md",
+            "02-design.md",
+            "03-tasks.md",
+            "sql-draft.sql",
+            "04-schema.sql",
+        ]
+    )
+    for name in input_names:
         path = record.parent / name
         entries.append((name, path.read_bytes() if path.exists() else b"<missing>"))
     interface_dir = record.parent / "interface-details"
@@ -1520,19 +1927,101 @@ def review_input_fingerprint(record: Path, code_fingerprint: str) -> str:
     return fingerprint_entries(entries)
 
 
+def optional_review_subject_fingerprint(record: Path, code_fingerprint: str) -> str:
+    """锁定可选 Review 的需求口径与代码差异，不绑定 Review 报告本身。"""
+    entries: list[tuple[str, bytes]] = [
+        ("code-fingerprint", code_fingerprint.encode("utf-8")),
+    ]
+    if record.name == "quick.md":
+        text = record.read_text(encoding="utf-8")
+        for heading in [
+            "## 1. 边界确认",
+            "## 2. 升级 full 触发条件",
+            "## 3. 实现摘要",
+            "## 4. 验证记录",
+        ]:
+            entries.append(
+                (heading, validator.extract_section(text, heading).encode("utf-8"))
+            )
+        return fingerprint_entries(entries)
+
+    for name in [
+        "00-baseline.md",
+        "02-design.md",
+        "03-tasks.md",
+        "sql-draft.sql",
+        "04-schema.sql",
+    ]:
+        path = record.parent / name
+        entries.append((name, path.read_bytes() if path.exists() else b"<missing>"))
+    interface_dir = record.parent / "interface-details"
+    if interface_dir.exists():
+        entries.extend(
+            (path.relative_to(record.parent).as_posix(), path.read_bytes())
+            for path in sorted(interface_dir.rglob("*"))
+            if path.is_file()
+        )
+    return fingerprint_entries(entries)
+
+
 def current_review_binding_errors(record: Path, state: dict, current: dict) -> list[str]:
     review = state.get("review") or {}
+    normalize_legacy_review_state(state)
     errors: list[str] = []
+    if review.get("model") == "optional":
+        if review.get("implementation_round") != state.get("round"):
+            errors.append("Review 对应实现轮次已变化")
+        if review.get("fingerprint") != current.get("fingerprint"):
+            errors.append("Review 对应代码差异已变化")
+        expected_subject = optional_review_subject_fingerprint(
+            record,
+            current.get("fingerprint", ""),
+        )
+        if review.get("subject_fingerprint") != expected_subject:
+            errors.append("Review 对应需求口径已变化")
+        return errors
     if review.get("implementation_round") != state.get("round"):
         errors.append("Review 对应实现轮次已变化")
     if review.get("fingerprint") != current.get("fingerprint"):
         errors.append("Review 对应代码差异已变化")
+    disposition = review_disposition(review)
+    if disposition == "skipped":
+        if review.get("result") != "skipped":
+            errors.append("Review skipped disposition 与结果不一致")
+        if review.get("decision_fingerprint") != review_skip_decision_fingerprint(record):
+            errors.append("Review 跳过决定在登记后发生变化")
+        return errors
+
     if int(state.get("schema_version", 1)) >= 6:
-        if review.get("input_fingerprint") != review_input_fingerprint(
-            record, current.get("fingerprint", "")
-        ):
+        expected_input = review_input_fingerprint(
+            record,
+            current.get("fingerprint", ""),
+            disposition,
+        )
+        legacy_input = (
+            review_input_fingerprint(
+                record,
+                current.get("fingerprint", ""),
+                "legacy",
+            )
+            if int(state.get("schema_version", 1)) < STATE_SCHEMA_VERSION
+            else ""
+        )
+        if review.get("input_fingerprint") not in {expected_input, legacy_input}:
             errors.append("Review 输入基线已变化")
-        if review.get("artifact_fingerprint") != review_artifact_fingerprint(record):
+        expected_artifact = review_artifact_fingerprint(record)
+        legacy_artifact = (
+            review_artifact_fingerprint(
+                record,
+                include_disposition_fields=False,
+            )
+            if int(state.get("schema_version", 1)) < STATE_SCHEMA_VERSION
+            else ""
+        )
+        if review.get("artifact_fingerprint") not in {
+            expected_artifact,
+            legacy_artifact,
+        }:
             errors.append("Review 报告在登记后发生变化")
     if review.get("reviewer_mode") is not None:
         mode = review.get("reviewer_mode")
@@ -1609,6 +2098,19 @@ def validate_reviewer_mode(mode: str | None, reason: str) -> tuple[str, str]:
     return mode, normalized_reason
 
 
+LIGHT_SELF_REVIEW_REASON = "light-review 默认由当前上下文执行，不要求 fresh reviewer"
+
+
+def resolve_review_provenance(
+    disposition: str,
+    mode: str | None,
+    reason: str,
+) -> tuple[str, str]:
+    if disposition == "light" and not mode:
+        return "self-review", LIGHT_SELF_REVIEW_REASON
+    return validate_reviewer_mode(mode, reason)
+
+
 def review_provenance_paths(record: Path) -> list[Path]:
     if record.name == "quick.md":
         return [record]
@@ -1657,6 +2159,8 @@ def reject_conflicting_review_provenance(
 
 def write_review_provenance(record: Path, mode: str, reason: str) -> None:
     if record.name == "quick.md":
+        if is_quick_v3_record(record):
+            return
         upsert_record_line_after(record, "- Review 方式：", mode, "- Review 结论：")
         upsert_record_line_after(
             record,
@@ -1691,9 +2195,158 @@ def write_review_provenance(record: Path, mode: str, reason: str) -> None:
     )
 
 
-def command_review_mark(args: argparse.Namespace) -> None:
+def write_review_disposition(record: Path, disposition: str) -> None:
+    ensure_review_record_fields(record)
+    fields = review_record_field_prefixes(record)
+    update_record_line(record, fields["disposition"], disposition)
+    if record.name == "quick.md":
+        return
+
+    latest = latest_review_round_file(record)
+    if latest is not None:
+        upsert_record_line_after(
+            latest,
+            "- Review disposition：",
+            disposition,
+            "- 评审范围：",
+        )
+    index = record.parent / "06-code-review.md"
+    if index.exists():
+        upsert_record_line_after(
+            index,
+            "- Review disposition：",
+            disposition,
+            "- 当前结论：",
+        )
+
+
+def validate_light_review_evidence(
+    record: Path,
+    result: str,
+    implementation_round: str,
+    fingerprint: str,
+) -> list[str]:
+    """Light Review 只校验逻辑、代码和文档结论，不强制全量 manifest。"""
+    expected = {
+        "passed": "通过",
+        "needs_changes": "需修改",
+        "blocked": "阻塞",
+    }[result]
+    errors: list[str] = []
+    if record.name == "quick.md":
+        text = record.read_text(encoding="utf-8")
+        if is_quick_v3_record(record, text):
+            fields = review_record_field_prefixes(record, text)
+            if validator.extract_line_value(
+                text,
+                fields["disposition"],
+            ).strip() != "light":
+                errors.append("quick.md v3 Review 处置必须为 light")
+            if result == "passed":
+                errors.extend(
+                    validator.validate_quick_review_evidence(
+                        record,
+                        set(),
+                    )
+                )
+            else:
+                errors.extend(
+                    validator.validate_quick_review_nonpass(
+                        record,
+                        result,
+                        set(),
+                    )
+                )
+            return errors
+        for label in ["- Review Gate A：", "- Review Gate B："]:
+            value = validator.extract_line_value(text, label)
+            if result == "passed" and value != "通过":
+                errors.append(f"quick light Review 通过时 {label}必须为通过")
+        return errors
+
+    latest = latest_review_round_file(record)
+    if latest is None:
+        return ["light Review 缺少 review-rNN.md 明细"]
+    text = latest.read_text(encoding="utf-8")
+    round_id = validator.extract_line_value(text, "- 轮次：")
+    if not re.fullmatch(r"R\d+", round_id):
+        errors.append(f"{latest.name} 缺少有效 Review 轮次")
+    if validator.extract_line_value(text, "- Review disposition：") != "light":
+        errors.append(f"{latest.name} Review disposition 必须为 light")
+    if validator.extract_line_value(text, "- 对应实现轮次：") != implementation_round:
+        errors.append(f"{latest.name} 对应实现轮次不一致")
+    if validator.extract_line_value(text, "- 实现差异指纹：") != fingerprint:
+        errors.append(f"{latest.name} 实现差异指纹不一致")
+    if validator.extract_line_value(text, "- 结论：") != expected:
+        errors.append(f"{latest.name} 结论必须为“{expected}”")
+
+    light_labels = [
+        "- 业务逻辑结论：",
+        "- 代码质量结论：",
+        "- 文档一致性结论：",
+        "- 契约 / SQL 结论：",
+        "- 异常 / 日志 / Trace 结论：",
+    ]
+    if any(label in text for label in light_labels):
+        for label in light_labels:
+            value = validator.extract_line_value(text, label)
+            can_be_not_applicable = label in {
+                "- 契约 / SQL 结论：",
+                "- 异常 / 日志 / Trace 结论：",
+            }
+            accepted = value == "通过" or (
+                can_be_not_applicable
+                and value.startswith("不涉及：")
+                and len(value.removeprefix("不涉及：").strip()) >= 4
+            )
+            if result == "passed" and not accepted:
+                errors.append(
+                    f"{latest.name} 通过时 {label}必须为通过或写明不涉及的具体原因"
+                )
+            elif value in validator.EMPTY_VALUES:
+                errors.append(f"{latest.name} 缺少 {label}")
+    else:
+        gate_a = validator.extract_line_value(text, "- Gate A 结论：")
+        gate_b = validator.extract_line_value(text, "- Gate B 结论：")
+        if result == "passed" and (gate_a != "通过" or gate_b != "通过"):
+            errors.append(f"{latest.name} light Review 通过时 Gate A/B 必须为通过")
+
+    index = record.parent / "06-code-review.md"
+    if index.exists():
+        index_text = index.read_text(encoding="utf-8")
+        if validator.extract_line_value(index_text, "- Review disposition：") != "light":
+            errors.append("06-code-review.md Review disposition 必须为 light")
+        if validator.extract_line_value(index_text, "- 当前结论：") != expected:
+            errors.append(f"06-code-review.md 当前结论必须为“{expected}”")
+    return errors
+
+
+def command_review_mark_legacy(args: argparse.Namespace) -> None:
     record = Path(args.record).resolve()
-    reviewer_mode, self_review_reason = validate_reviewer_mode(
+    requested_disposition = getattr(args, "disposition", None)
+    if requested_disposition:
+        disposition = requested_disposition
+    elif getattr(args, "reviewer_mode", None):
+        # 旧调用显式 fresh/self 时保持 formal 语义。
+        disposition = "formal"
+    else:
+        record_text = record.read_text(encoding="utf-8")
+        disposition = (
+            "light"
+            if (
+                record.name == "quick.md"
+                and validator.quick_schema_version(record_text) >= 3
+            )
+            or (
+                record.name == "05-implementation-log.md"
+                and validator.implementation_schema_version(record_text) >= 2
+            )
+            else "formal"
+        )
+    if disposition not in {"light", "formal"}:
+        raise SystemExit("review-mark 的 --disposition 只允许 light 或 formal")
+    reviewer_mode, self_review_reason = resolve_review_provenance(
+        disposition,
         getattr(args, "reviewer_mode", None),
         getattr(args, "self_review_reason", None) or "",
     )
@@ -1715,7 +2368,27 @@ def command_review_mark(args: argparse.Namespace) -> None:
                 "仍有未完成的编码任务，不能登记 Review 通过: "
                 + ", ".join(missing_tasks)
             )
-    input_fingerprint = review_input_fingerprint(record, current["fingerprint"])
+    write_review_disposition(record, disposition)
+    review_fields = review_record_field_prefixes(record)
+    result_label = {
+        "passed": "通过",
+        "needs_changes": "需修改",
+        "blocked": "阻塞",
+    }[args.result]
+    if is_quick_v3_record(record):
+        # quick v3 的状态字段由登记命令维护，用户只需填写简洁复核证据。
+        update_record_line(record, review_fields["result"], result_label)
+        update_record_line(
+            record,
+            review_fields["gate_satisfied"],
+            "是" if args.result == "passed" else "否",
+        )
+        update_record_line(record, review_fields["skip_reason"], "不涉及")
+    input_fingerprint = review_input_fingerprint(
+        record,
+        current["fingerprint"],
+        disposition,
+    )
     reject_conflicting_review_provenance(
         record,
         reviewer_mode,
@@ -1740,7 +2413,19 @@ def command_review_mark(args: argparse.Namespace) -> None:
         for repository in repositories
         for item in repository.get("files", [])
     }
-    if args.result == "passed":
+    if disposition == "light":
+        review_errors = validate_light_review_evidence(
+            record,
+            args.result,
+            state.get("round", ""),
+            current["fingerprint"],
+        )
+        if review_errors:
+            print("[FAIL] Light Review 最小门禁未通过：")
+            for error in review_errors:
+                print(f"- {error}")
+            raise SystemExit(1)
+    elif args.result == "passed":
         if record.name == "quick.md":
             review_errors = validator.validate_quick_review_evidence(
                 record,
@@ -1790,10 +2475,23 @@ def command_review_mark(args: argparse.Namespace) -> None:
             for error in review_errors:
                 print(f"- {error}")
             raise SystemExit(1)
-    result_label = {"passed": "通过", "needs_changes": "需修改", "blocked": "阻塞"}[args.result]
-    update_record_line(record, "- Review 结论：", result_label)
-    update_record_line(record, "- Review 对应实现轮次：", state.get("round", ""))
-    update_record_line(record, "- Review 对应差异指纹：", current["fingerprint"])
+    update_record_line(record, review_fields["result"], result_label)
+    update_record_line(
+        record,
+        review_fields["gate_satisfied"],
+        "是" if args.result == "passed" else "否",
+    )
+    update_record_line(
+        record,
+        review_fields["skip_reason"],
+        "不涉及" if is_quick_v3_record(record) else "",
+    )
+    update_record_line(
+        record,
+        review_fields["implementation_round"],
+        state.get("round", ""),
+    )
+    update_record_line(record, review_fields["fingerprint"], current["fingerprint"])
     review_round = "quick" if record.name == "quick.md" else latest_review_round(record)
     if not review_round:
         raise SystemExit("Review 记录缺少有效轮次，不能登记结论")
@@ -1803,6 +2501,9 @@ def command_review_mark(args: argparse.Namespace) -> None:
         "review_round": review_round,
         "input_fingerprint": input_fingerprint,
         "artifact_fingerprint": review_artifact_fingerprint(record),
+        "disposition": disposition,
+        "gate_satisfied": args.result == "passed",
+        "passed": args.result == "passed",
         "reviewer_mode": reviewer_mode,
         "self_review_reason": (
             self_review_reason if reviewer_mode == "self-review" else None
@@ -1810,13 +2511,191 @@ def command_review_mark(args: argparse.Namespace) -> None:
         "result": args.result,
         "reviewed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
     }
-    state["schema_version"] = max(int(state.get("schema_version", 1)), 8)
+    state["test"] = None
     save_state(record, state)
     print(f"[OK] 已登记 {state.get('round')} Review 结论: {args.result}")
+    print(f"[OK] Review disposition: {disposition}")
     print(f"[OK] Review 方式: {reviewer_mode}")
     if reviewer_mode == "self-review":
         print(f"[SELF-REVIEW] 本轮不是独立评审: {self_review_reason}")
     print(f"[OK] Review 差异指纹: {current['fingerprint']}")
+
+
+def sync_optional_review_status(record: Path, result: str) -> None:
+    if record.name == "quick.md":
+        return
+    meta_path = record.parent / "meta.json"
+    if not meta_path.exists():
+        return
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["review_status"] = result
+    meta.pop("review_disposition", None)
+    gates = meta.setdefault("gates", {})
+    gates.pop("review_passed", None)
+    gates.pop("review_gate_satisfied", None)
+    if meta.get("current_phase") == "代码检查":
+        meta["current_status"] = {
+            "passed": "已检查",
+            "needs_changes": "发现问题",
+            "blocked": "检查阻塞",
+        }[result]
+    atomic_write_text(meta_path, json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
+
+
+def command_optional_review_mark(args: argparse.Namespace) -> None:
+    """登记单一可选 Review；结论只供用户参考，不形成测试门禁。"""
+    record = Path(args.record).resolve()
+    state = load_state(record)
+    if state.get("status") != "completed" or not state.get("completion_snapshot"):
+        raise SystemExit("实现会话尚未完成，不能登记 Review 结论")
+    current = current_snapshot(state)
+    if current.get("fingerprint") != state["completion_snapshot"].get("fingerprint"):
+        raise SystemExit("代码已偏离实现完成快照，不能登记 Review 结论")
+
+    result_label = {
+        "passed": "通过",
+        "needs_changes": "需修改",
+        "blocked": "阻塞",
+    }[args.result]
+    report: Path | None = None
+    if record.name != "quick.md":
+        report = record.parent / "06-code-review.md"
+        if not report.exists() or not is_optional_review_record(report):
+            raise SystemExit("缺少新版 06-code-review.md；请先执行 to-review")
+    fields = review_record_field_prefixes(record)
+    update_record_line(record, fields["status"], "已执行")
+    update_record_line(record, fields["result"], result_label)
+    update_record_line(record, fields["implementation_round"], state.get("round", ""))
+    update_record_line(record, fields["fingerprint"], current["fingerprint"])
+
+    if report is not None:
+        update_record_line(
+            report,
+            "- 检查时间：",
+            dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        )
+        update_record_line(report, "- 对应实现轮次：", state.get("round", ""))
+        update_record_line(report, "- 实现差异指纹：", current["fingerprint"])
+        update_record_line(report, "- 结论：", result_label)
+
+    review_errors = validator.validate_optional_review(
+        record,
+        args.result,
+        state.get("round", ""),
+        current["fingerprint"],
+    )
+    if review_errors:
+        print("[FAIL] 可选 Review 记录未收口：")
+        for error in review_errors:
+            print(f"- {error}")
+        raise SystemExit(1)
+
+    state["review"] = {
+        "model": "optional",
+        "result": args.result,
+        "implementation_round": state.get("round"),
+        "fingerprint": current["fingerprint"],
+        "subject_fingerprint": optional_review_subject_fingerprint(
+            record,
+            current["fingerprint"],
+        ),
+        "reviewed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    save_state(record, state)
+    sync_optional_review_status(record, args.result)
+    print(f"[OK] 已登记可选 Review 结论: {args.result}")
+    print("[NOTICE] Review 结论不构成测试门禁，后续动作由用户决定")
+
+
+def command_review_mark(args: argparse.Namespace) -> None:
+    record = Path(args.record).resolve()
+    if is_optional_review_record(record):
+        command_optional_review_mark(args)
+        return
+    command_review_mark_legacy(args)
+
+
+def command_review_skip(args: argparse.Namespace) -> None:
+    """记录用户跳过 Review；解除门禁但绝不伪装为 Review 通过。"""
+    record = Path(args.record).resolve()
+    if is_optional_review_record(record):
+        raise SystemExit("新版 Review 本来就是可选的，未执行时无需登记 review-skip")
+    reason = (args.reason or "").strip()
+    if not reason:
+        raise SystemExit("review-skip 必须提供用户明确跳过 Review 的 --reason")
+    state = load_state(record)
+    if state.get("status") != "completed" or not state.get("completion_snapshot"):
+        raise SystemExit("实现会话尚未完成，不能跳过 Review")
+    current = current_snapshot(state)
+    if current.get("fingerprint") != state["completion_snapshot"].get("fingerprint"):
+        raise SystemExit("代码已偏离实现完成快照，不能登记 Review 跳过决定")
+
+    ensure_review_record_fields(record)
+    review_fields = review_record_field_prefixes(record)
+    quick_v3 = is_quick_v3_record(record)
+    update_record_line(
+        record,
+        review_fields["result"],
+        "已跳过" if quick_v3 else "已跳过（未评审）",
+    )
+    update_record_line(record, review_fields["disposition"], "skipped")
+    update_record_line(record, review_fields["gate_satisfied"], "是")
+    update_record_line(record, review_fields["skip_reason"], reason)
+    update_record_line(
+        record,
+        review_fields["implementation_round"],
+        state.get("round", ""),
+    )
+    update_record_line(record, review_fields["fingerprint"], current["fingerprint"])
+    if record.name == "quick.md":
+        if not quick_v3 and "- Review 方式：" in record.read_text(encoding="utf-8"):
+            update_record_line(record, "- Review 方式：", "未执行")
+    else:
+        index = record.parent / "06-code-review.md"
+        if index.exists():
+            upsert_record_line_after(
+                index,
+                "- Review disposition：",
+                "skipped",
+                "- 当前结论：",
+            )
+            update_record_line(index, "- 当前结论：", "已跳过（未评审）")
+            if "- Review 门禁是否满足：" in index.read_text(encoding="utf-8"):
+                update_record_line(index, "- Review 门禁是否满足：", "是")
+            update_record_line(
+                index,
+                "- 是否允许进入测试验证：",
+                "是（用户明确跳过 Review，未评审）",
+            )
+            update_record_line(index, "- 需要回到实现阶段的问题：", "无")
+            upsert_record_line_after(
+                index,
+                "- Review 跳过原因：",
+                reason,
+                "- Self-review 原因：",
+            )
+            update_record_line(index, "- 对应实现轮次：", state.get("round", ""))
+            update_record_line(index, "- 实现差异指纹：", current["fingerprint"])
+
+    state["review"] = {
+        "implementation_round": state.get("round"),
+        "fingerprint": current["fingerprint"],
+        "review_round": "skipped",
+        "disposition": "skipped",
+        "result": "skipped",
+        "gate_satisfied": True,
+        "passed": False,
+        "skip_reason": reason,
+        "skipped_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    state["review"]["decision_fingerprint"] = review_skip_decision_fingerprint(
+        record
+    )
+    state["test"] = None
+    save_state(record, state)
+    print(f"[OK] 已登记 {state.get('round')} Review disposition: skipped")
+    print("[NOTICE] Review 门禁已解除，但本轮未经过 Review，不能表述为 Review 通过")
+    print(f"- 跳过原因: {reason}")
 
 
 def command_review_status(args: argparse.Namespace) -> None:
@@ -1824,8 +2703,8 @@ def command_review_status(args: argparse.Namespace) -> None:
     state = load_state(record)
     review = state.get("review") or {}
     if not review:
-        print("[PENDING] 当前实现轮次尚未登记 Review 结论")
-        raise SystemExit(1)
+        print("[NOT RUN] 当前实现轮次未执行 Review；Review 可选，不影响测试")
+        return
     current = current_snapshot(state)
     binding_errors = current_review_binding_errors(record, state, current)
     if binding_errors:
@@ -1833,27 +2712,70 @@ def command_review_status(args: argparse.Namespace) -> None:
         for error in binding_errors:
             print(f"- {error}")
         raise SystemExit(1)
+    if review.get("model") == "optional":
+        print(f"对应实现轮次: {review.get('implementation_round')}")
+        print(f"Review 结论: {review.get('result')}")
+        print(f"Review 差异指纹: {review.get('fingerprint')}")
+        print("Review 类型: 可选检查（不构成测试门禁）")
+        if getattr(args, "require_passed", False) and review.get("result") != "passed":
+            raise SystemExit(1)
+        return
     print(f"Review 轮次: {review.get('review_round')}")
     print(f"对应实现轮次: {review.get('implementation_round')}")
     print(f"Review 结论: {review.get('result')}")
     print(f"Review 差异指纹: {review.get('fingerprint')}")
     print(f"Review 输入指纹: {review.get('input_fingerprint')}")
     print(f"Review 工件指纹: {review.get('artifact_fingerprint')}")
+    disposition = review_disposition(review)
+    print(f"Review disposition: {disposition}")
+    print(f"Review 门禁是否满足: {'是' if review_gate_satisfied(review) else '否'}")
+    print(f"Review 是否通过: {'是' if review_passed(review) else '否'}")
+    if disposition == "skipped":
+        print("[SKIPPED] 用户已跳过 Review，本轮未评审")
+        print(f"跳过原因: {review.get('skip_reason')}")
     reviewer_mode = review.get("reviewer_mode") or "legacy-unknown"
-    print(f"Review 方式: {reviewer_mode}")
-    if reviewer_mode == "self-review":
+    if disposition != "skipped":
+        print(f"Review 方式: {reviewer_mode}")
+    if disposition != "skipped" and reviewer_mode == "self-review":
         print("[SELF-REVIEW] 本轮不是独立评审")
         print(f"Self-review 原因: {review.get('self_review_reason')}")
-    elif reviewer_mode == "legacy-unknown":
+    elif disposition != "skipped" and reviewer_mode == "legacy-unknown":
         print("[NOTICE] 旧 Review 未记录评审方式，不得视为独立评审")
-    if args.require_passed and review.get("result") != "passed":
+    if getattr(args, "require_passed", False) and not review_passed(review):
+        raise SystemExit(1)
+    if (
+        getattr(args, "require_gate_satisfied", False)
+        and not review_gate_satisfied(review)
+    ):
         raise SystemExit(1)
 
 
 def test_artifact_fingerprint(record: Path) -> str:
     """锁定实际测试记录，避免登记通过后继续修改报告却沿用旧结论。"""
     if record.name == "quick.md":
-        entries = [(record.name, record.read_bytes())]
+        text = record.read_text(encoding="utf-8")
+        test_values = "\n".join(
+            f"{prefix}{validator.extract_line_value(text, prefix)}"
+            for prefix in [
+                "- 测试结论：",
+                "- 测试对应实现轮次：",
+                "- 测试对应差异指纹：",
+                "- 最终结论：",
+                "- 后续动作：",
+            ]
+        )
+        entries = [
+            (
+                "quick-test",
+                (
+                    test_values
+                    + "\n"
+                    + validator.extract_section(text, "### 5.2 Quick 测试场景")
+                    + "\n"
+                    + validator.extract_section(text, "### 5.3 Quick 命令证据")
+                ).encode("utf-8"),
+            )
+        ]
         reports_dir = record.parent / "reports"
         if reports_dir.exists():
             entries.extend(
@@ -2247,8 +3169,167 @@ def append_test_execution_record(
     )
 
 
+def record_test_process_execution(
+    record: Path,
+    round_file: Path,
+    run: dict,
+) -> None:
+    if record.name == "quick.md":
+        return
+    text = round_file.read_text(encoding="utf-8")
+    values = {
+        "- 命令执行方式：": "one-shot non-PTY",
+        "- 命令超时秒数：": str(run["timeout_seconds"]),
+        "- 残留进程检查：": (
+            "仍有残留"
+            if run["residual_processes_after_cleanup"]
+            else "检测到同进程组残留并已处理"
+            if run["residual_processes_detected"]
+            else "无"
+        ),
+        "- 进程回收结果：": (
+            "回收失败"
+            if run["residual_processes_after_cleanup"]
+            else "TERM 后 KILL 已回收"
+            if run["process_group_kill_sent"]
+            else "TERM 已回收"
+            if run["process_group_term_sent"]
+            else "不涉及"
+        ),
+    }
+    for prefix, value in values.items():
+        if any(line.strip().startswith(prefix) for line in text.splitlines()):
+            update_record_line(round_file, prefix, value)
+            text = round_file.read_text(encoding="utf-8")
+
+
+def process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def wait_for_process_group_exit(
+    process_group_id: int,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while process_group_exists(process_group_id):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def terminate_process_group(
+    process: subprocess.Popen,
+    grace_seconds: float = 2.0,
+) -> tuple[bytes, bytes, bool, bool, bool]:
+    """先 TERM 再 KILL 回收整组进程，避免测试终端和孙进程常驻。"""
+    term_sent = False
+    kill_sent = False
+    if process_group_exists(process.pid):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            term_sent = True
+        except ProcessLookupError:
+            pass
+    try:
+        stdout, stderr = process.communicate(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        stdout = b""
+        stderr = b""
+
+    exited = wait_for_process_group_exit(process.pid, grace_seconds)
+    if not exited:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            kill_sent = True
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            stdout = stdout or b""
+            stderr = stderr or b""
+        wait_for_process_group_exit(process.pid, grace_seconds)
+    else:
+        completed_stdout, completed_stderr = process.communicate()
+        stdout = completed_stdout if completed_stdout is not None else stdout
+        stderr = completed_stderr if completed_stderr is not None else stderr
+    remaining = process_group_exists(process.pid)
+    return stdout or b"", stderr or b"", term_sent, kill_sent, remaining
+
+
+def run_test_command_once(
+    command: list[str],
+    cwd: Path,
+    timeout_seconds: int,
+) -> tuple[int, bytes, bytes, bool, bool, bool, bool, bool]:
+    """以一次性、非 PTY 进程组执行命令并返回回收事实。"""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+        residual_detected = process_group_exists(process.pid)
+        term_sent = False
+        kill_sent = False
+        residual_remaining = residual_detected
+        if residual_detected:
+            (
+                cleanup_stdout,
+                cleanup_stderr,
+                term_sent,
+                kill_sent,
+                residual_remaining,
+            ) = terminate_process_group(process)
+            stdout = cleanup_stdout if cleanup_stdout else stdout
+            stderr = cleanup_stderr if cleanup_stderr else stderr
+        return (
+            int(process.returncode),
+            stdout or b"",
+            stderr or b"",
+            False,
+            residual_detected,
+            term_sent,
+            kill_sent,
+            residual_remaining,
+        )
+    except subprocess.TimeoutExpired:
+        (
+            stdout,
+            stderr,
+            term_sent,
+            kill_sent,
+            residual_remaining,
+        ) = terminate_process_group(process)
+        return (
+            124,
+            stdout,
+            stderr,
+            True,
+            True,
+            term_sent,
+            kill_sent,
+            residual_remaining,
+        )
+    except BaseException:
+        terminate_process_group(process)
+        raise
+
+
 def command_test_run(args: argparse.Namespace) -> None:
-    """无 shell 执行自动化测试，并把机器证据绑定到当前实现、Review 和 TSxx。"""
+    """无 shell 执行自动化测试，并把机器证据绑定到当前实现和 TSxx。"""
     record = Path(args.record).resolve()
     state = load_state(record)
     if state.get("status") != "completed" or not state.get("completion_snapshot"):
@@ -2256,13 +3337,6 @@ def command_test_run(args: argparse.Namespace) -> None:
     current = current_snapshot(state)
     if current.get("fingerprint") != state["completion_snapshot"].get("fingerprint"):
         raise SystemExit("代码已偏离实现完成快照，不能执行测试")
-    review = state.get("review") or {}
-    review_errors = current_review_binding_errors(record, state, current)
-    if review.get("result") != "passed":
-        review_errors.insert(0, "Review 结论不是 passed")
-    if review_errors:
-        raise SystemExit("Review 未通过或已失效，不能执行测试: " + "；".join(review_errors))
-
     command = list(args.test_command)
     if command and command[0] == "--":
         command = command[1:]
@@ -2293,22 +3367,25 @@ def command_test_run(args: argparse.Namespace) -> None:
     started_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     timed_out = False
     environment_blocked = False
+    residual_processes_detected = False
+    term_sent = False
+    kill_sent = False
+    residual_processes_after_cleanup = False
     try:
-        completed = subprocess.run(
+        (
+            exit_code,
+            stdout,
+            stderr,
+            timed_out,
+            residual_processes_detected,
+            term_sent,
+            kill_sent,
+            residual_processes_after_cleanup,
+        ) = run_test_command_once(
             command,
-            cwd=cwd,
-            check=False,
-            capture_output=True,
-            timeout=args.timeout_seconds,
+            cwd,
+            args.timeout_seconds,
         )
-        exit_code = completed.returncode
-        stdout = completed.stdout
-        stderr = completed.stderr
-    except subprocess.TimeoutExpired as error:
-        timed_out = True
-        exit_code = 124
-        stdout = error.stdout or b""
-        stderr = error.stderr or b""
     except OSError as error:
         environment_blocked = True
         exit_code = 127
@@ -2319,7 +3396,7 @@ def command_test_run(args: argparse.Namespace) -> None:
         "stale"
         if before["fingerprint"] != after["fingerprint"]
         else "blocked"
-        if timed_out or environment_blocked
+        if timed_out or environment_blocked or residual_processes_after_cleanup
         else "passed"
         if exit_code == 0
         else "failed"
@@ -2333,7 +3410,7 @@ def command_test_run(args: argparse.Namespace) -> None:
     redacted_argv = redact_test_argv(command)
     sensitive_argv_values = sensitive_test_argv_values(command)
     run = {
-        "schema_version": 1,
+        "schema_version": 2,
         "execution_id": execution_id,
         "test_round": round_id,
         "test_mode": mode,
@@ -2341,9 +3418,6 @@ def command_test_run(args: argparse.Namespace) -> None:
         "scenario_plan_fingerprint": scenario_fingerprint,
         "implementation_round": state.get("round"),
         "implementation_fingerprint": current["fingerprint"],
-        "review_round": review.get("review_round"),
-        "review_input_fingerprint": review.get("input_fingerprint"),
-        "review_artifact_fingerprint": review.get("artifact_fingerprint"),
         "argv": redacted_argv,
         "cwd": str(cwd),
         "environment": redact_sensitive_text(args.environment.strip()),
@@ -2354,6 +3428,12 @@ def command_test_run(args: argparse.Namespace) -> None:
         "duration_ms": int((time.monotonic() - started_wall) * 1000),
         "exit_code": exit_code,
         "timed_out": timed_out,
+        "execution_mode": "one-shot non-PTY",
+        "timeout_seconds": args.timeout_seconds,
+        "residual_processes_detected": residual_processes_detected,
+        "process_group_term_sent": term_sent,
+        "process_group_kill_sent": kill_sent,
+        "residual_processes_after_cleanup": residual_processes_after_cleanup,
         "stdout": redact_test_output(stdout, sensitive_values=sensitive_argv_values),
         "stderr": redact_test_output(stderr, sensitive_values=sensitive_argv_values),
         "before_snapshot_fingerprint": before["fingerprint"],
@@ -2371,6 +3451,7 @@ def command_test_run(args: argparse.Namespace) -> None:
     state["test_runs"] = test_runs
     save_state(record, state)
     append_test_execution_record(record, round_file, run)
+    record_test_process_execution(record, round_file, run)
 
     stdout_summary = run["stdout"]["summary"]
     stderr_summary = run["stderr"]["summary"]
@@ -2441,7 +3522,6 @@ def machine_test_run_errors(record: Path, state: dict, current: dict) -> list[st
             "存在没有 test-run 状态的手写 command 证据: "
             + ", ".join(handwritten)
         )
-    review = state.get("review") or {}
     for run in runs:
         execution_id = str(run.get("execution_id"))
         row = machine_rows.get(execution_id)
@@ -2451,9 +3531,6 @@ def machine_test_run_errors(record: Path, state: dict, current: dict) -> list[st
         for key, expected in [
             ("implementation_round", state.get("round")),
             ("implementation_fingerprint", current.get("fingerprint")),
-            ("review_round", review.get("review_round")),
-            ("review_input_fingerprint", review.get("input_fingerprint")),
-            ("review_artifact_fingerprint", review.get("artifact_fingerprint")),
         ]:
             if run.get(key) != expected:
                 errors.append(f"{execution_id} 的 {key} 已失效")
@@ -2589,22 +3666,6 @@ def command_test_mark(args: argparse.Namespace) -> None:
     completed = state["completion_snapshot"]
     if current["fingerprint"] != completed.get("fingerprint"):
         raise SystemExit("代码已偏离实现完成快照，不能登记测试结论")
-    review = state.get("review") or {}
-    review_errors = current_review_binding_errors(record, state, current)
-    if review.get("result") != "passed":
-        review_errors.insert(0, "Review 结论不是 passed")
-    if review_errors:
-        raise SystemExit("Review 未通过或已失效，不能登记测试结论: " + "；".join(review_errors))
-    if not review.get("input_fingerprint") or not review.get("artifact_fingerprint"):
-        review["review_round"] = review.get("review_round") or (
-            "quick" if record.name == "quick.md" else latest_review_round(record)
-        )
-        review["input_fingerprint"] = review_input_fingerprint(
-            record,
-            current["fingerprint"],
-        )
-        review["artifact_fingerprint"] = review_artifact_fingerprint(record)
-        state["review"] = review
     machine_errors = machine_test_run_errors(record, state, current)
     if machine_errors:
         print("[FAIL] test-run 机器证据门禁未通过：")
@@ -2631,7 +3692,7 @@ def command_test_mark(args: argparse.Namespace) -> None:
                 record.parent / "test-rounds",
                 expected_implementation_round=state.get("round"),
                 expected_fingerprint=current["fingerprint"],
-                expected_review_round=review.get("review_round", ""),
+                expected_review_round=None,
                 actual_paths=actual_paths,
             )
         if test_errors:
@@ -2653,7 +3714,7 @@ def command_test_mark(args: argparse.Namespace) -> None:
                 result=args.result,
                 expected_implementation_round=state.get("round", ""),
                 expected_fingerprint=current["fingerprint"],
-                expected_review_round=review.get("review_round", ""),
+                expected_review_round=None,
             )
         if test_errors:
             print("[FAIL] 测试非通过结论缺少最小证据：")
@@ -2670,8 +3731,6 @@ def command_test_mark(args: argparse.Namespace) -> None:
     state["test"] = {
         "implementation_round": state.get("round"),
         "fingerprint": current["fingerprint"],
-        "review_round": review.get("review_round"),
-        "review_artifact_fingerprint": review.get("artifact_fingerprint"),
         "result": args.result,
         "artifact_fingerprint": test_artifact_fingerprint(record),
         "machine_evidence_fingerprint": machine_test_runs_fingerprint(
@@ -2680,7 +3739,6 @@ def command_test_mark(args: argparse.Namespace) -> None:
         ),
         "tested_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
     }
-    state["schema_version"] = max(int(state.get("schema_version", 1)), 9)
     save_state(record, state)
     sync_test_gate(record, args.result)
     print(f"[OK] 已登记 {state.get('round')} 测试结论: {args.result}")
@@ -2700,21 +3758,6 @@ def command_test_status(args: argparse.Namespace) -> None:
         or test.get("fingerprint") != current.get("fingerprint")
     ):
         print("[STALE] 测试结论对应的实现轮次或差异指纹已经变化")
-        raise SystemExit(1)
-    review_errors = current_review_binding_errors(record, state, current)
-    if (state.get("review") or {}).get("result") != "passed":
-        review_errors.insert(0, "Review 结论不再是 passed")
-    if review_errors:
-        print("[STALE] 测试所依赖的 Review 已失效：")
-        for error in review_errors:
-            print(f"- {error}")
-        raise SystemExit(1)
-    review = state.get("review") or {}
-    if (
-        test.get("review_round") != review.get("review_round")
-        or test.get("review_artifact_fingerprint") != review.get("artifact_fingerprint")
-    ):
-        print("[STALE] 测试绑定的 Review 轮次或报告指纹已变化")
         raise SystemExit(1)
     current_artifact_fingerprint = test_artifact_fingerprint(record)
     if test.get("artifact_fingerprint") != current_artifact_fingerprint:
@@ -2736,13 +3779,20 @@ def command_test_status(args: argparse.Namespace) -> None:
     print(f"测试对应实现轮次: {test.get('implementation_round')}")
     print(f"测试结论: {test.get('result')}")
     print(f"测试差异指纹: {test.get('fingerprint')}")
-    print(f"测试对应 Review 轮次: {test.get('review_round')}")
     print(f"测试工件指纹: {test.get('artifact_fingerprint')}")
     if args.require_passed and test.get("result") != "passed":
         raise SystemExit(1)
 
 
 def main() -> None:
+    # 历史直调命令仍可读，但不再出现在新版命令帮助中。
+    if len(sys.argv) > 1 and sys.argv[1] == "review-skip":
+        legacy_parser = argparse.ArgumentParser(description="历史 Review 记录兼容")
+        legacy_parser.add_argument("--record", required=True)
+        legacy_parser.add_argument("--reason", required=True)
+        command_review_skip(legacy_parser.parse_args(sys.argv[2:]))
+        return
+
     parser = argparse.ArgumentParser(description="管理 GGG 编码实现会话")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -2766,6 +3816,18 @@ def main() -> None:
         help="接管启动前已属于本需求的 Git 脏文件；单仓可用相对路径，多仓必须用绝对路径",
     )
     start_parser.add_argument(
+        "--diff-range",
+        action="append",
+        default=[],
+        help="绑定已提交差异 <base>..<target>；多仓时按 --repo-root 顺序各传一次",
+    )
+    start_parser.add_argument(
+        "--adopt-commit",
+        action="append",
+        default=[],
+        help="绑定单个已提交功能提交，等价 commit^..commit；多仓时按顺序各传一次",
+    )
+    start_parser.add_argument(
         "--task",
         action="append",
         default=[],
@@ -2781,6 +3843,7 @@ def main() -> None:
     verify_parser.add_argument("--record", required=True)
     verify_parser.add_argument("--cwd")
     verify_parser.add_argument("--label")
+    verify_parser.add_argument("--timeout-seconds", type=int, default=60)
     verify_parser.add_argument("verification_command", nargs=argparse.REMAINDER)
     verify_parser.set_defaults(handler=command_verify)
 
@@ -2802,15 +3865,30 @@ def main() -> None:
     review_mark_parser.add_argument("--record", required=True)
     review_mark_parser.add_argument("--result", required=True, choices=["passed", "needs_changes", "blocked"])
     review_mark_parser.add_argument(
+        "--disposition",
+        choices=["light", "formal"],
+        help=argparse.SUPPRESS,
+    )
+    review_mark_parser.add_argument(
         "--reviewer-mode",
         choices=["fresh-review", "self-review"],
+        help=argparse.SUPPRESS,
     )
-    review_mark_parser.add_argument("--self-review-reason")
+    review_mark_parser.add_argument("--self-review-reason", help=argparse.SUPPRESS)
     review_mark_parser.set_defaults(handler=command_review_mark)
 
     review_status_parser = subparsers.add_parser("review-status")
     review_status_parser.add_argument("--record", required=True)
-    review_status_parser.add_argument("--require-passed", action="store_true")
+    review_status_parser.add_argument(
+        "--require-passed",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    review_status_parser.add_argument(
+        "--require-gate-satisfied",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     review_status_parser.set_defaults(handler=command_review_status)
 
     test_run_parser = subparsers.add_parser("test-run")
@@ -2825,7 +3903,7 @@ def main() -> None:
         choices=sorted(validator.TEST_EFFECTS),
     )
     test_run_parser.add_argument("--effect-authorization")
-    test_run_parser.add_argument("--timeout-seconds", type=int, default=300)
+    test_run_parser.add_argument("--timeout-seconds", type=int, default=60)
     test_run_parser.add_argument("test_command", nargs=argparse.REMAINDER)
     test_run_parser.set_defaults(handler=command_test_run)
 

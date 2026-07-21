@@ -1,4 +1,4 @@
 interface:
   display_name: "GGG Task Breakdown"
-  short_description: "把已确认方案拆成纵向、轻量、可追溯且可直接编码的任务"
-  default_prompt: "使用 $ggg-task-breakdown，把已确认技术方案拆成纵向业务编码任务；跨项目分开、依赖无环，风险所需测试代码并入对应功能 Txx，完成标准写明最小验证，不生成测试执行或报告任务。"
+  short_description: "把已确认方案拆成可直接编码的纵向任务，默认不新增测试类"
+  default_prompt: "使用 $ggg-task-breakdown 把已确认方案拆成纵向编码任务，默认不规划测试类，并为每个任务写清代码落点、依赖和最小验证。"

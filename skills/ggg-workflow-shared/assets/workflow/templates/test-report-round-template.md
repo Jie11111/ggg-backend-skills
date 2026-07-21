@@ -10,9 +10,11 @@
 - 测试范围：
 - 环境与版本：
 - token / 角色类型：
+- 命令执行方式：one-shot non-PTY / 不涉及：仅 API 或人工观察
+- 命令超时秒数：60 / 不涉及
 - 对应实现轮次：
 - 实现差异指纹：
-- 对应 Review 轮次：
+- Review 输入：未执行 / 可选参考 `06-code-review.md`
 
 ## 2. 测试结论
 
@@ -25,11 +27,11 @@
 
 ## 3. 测试依据覆盖
 
-> 本表同时是测试来源 Manifest。`formal-gate` 必须枚举全部验收目标、关键规则、Review 缺口、diff 行为、副作用、兼容边界和被触发的 NFR；不能只登记准备执行的部分。
+> 本表同时是测试来源 Manifest。`formal-gate` 必须枚举全部验收目标、关键规则、diff 行为、副作用、兼容边界和被触发的 NFR；如果做过可选 Review，再纳入其中尚需验证的问题。不能只登记准备执行的部分。
 
 | 依据ID | 来源类型 | 来源定位 | 要证明的业务结果或风险 | 风险 | 必测 | Effect | 覆盖场景 | 覆盖结论 | 不适用/豁免事实与授权 |
 |---|---|---|---|---|---|---|---|---|---|
-| TB1 | 验收 / 规则 / Review / diff / 兼容 / NFR | 00-baseline.md B1 / Review CR1 / 文件:行号 |  | 高 / 中 / 低 | 是 / 否 | read-only / local-write / data-write / state-change / message-or-job / external-side-effect | TS1 | 已覆盖 / 未覆盖 / 不适用 | 无 / 事实原因；授权者与剩余风险 |
+| TB1 | 验收 / 规则 / Review / diff / 兼容 / NFR | 00-baseline.md B1 / 可选 Review 问题 / 文件:行号 |  | 高 / 中 / 低 | 是 / 否 | read-only / local-write / data-write / state-change / message-or-job / external-side-effect | TS1 | 已覆盖 / 未覆盖 / 不适用 | 无 / 事实原因；授权者与剩余风险 |
 
 ## 4. 测试场景清单
 
@@ -41,7 +43,7 @@
 
 ## 5. 执行记录
 
-> Exx 记录实际发生的执行，不记录计划。可执行命令必须通过 `test-run` 写入，并以 `command:` 开头；API 报告和人工观察分别使用 `api:`、`observation:`。原始证据统一放在 feature 的 `reports/` 下并脱敏。
+> Exx 记录实际发生的执行，不记录计划。可执行命令必须通过一次性、非 PTY 的 `test-run` 写入，并以 `command:` 开头；默认 60 秒超时，超时后回收整个进程组。API 报告和人工观察分别使用 `api:`、`observation:`。原始证据统一放在 feature 的 `reports/` 下并脱敏。
 
 | 执行ID | 场景ID | 时间 | cwd / 环境 / 版本 | 命令/接口/观察点 | 退出码/协议结果 | 实际结果摘要 | Effect | 原始证据 | 证据 SHA-256 | 结论 |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -57,6 +59,8 @@
 - 清理、恢复或最终状态回查：
 - 恢复/回查证据及 SHA-256：
 - 遗留数据及影响：
+- 残留进程检查：无 / 检测到同进程组残留并已处理 / 仍有残留
+- 进程回收结果：不涉及 / TERM 已回收 / TERM 后 KILL 已回收 / 回收失败
 
 ## 7. 缺口和阻塞
 

@@ -23,7 +23,8 @@ ALLOWED_SOURCE_PHASES = {
     "任务拆分": ["技术方案", "任务拆分"],
     "编码实现": ["任务拆分", "编码实现"],
     "代码检查": ["编码实现", "代码检查"],
-    "测试验证": ["代码检查", "测试验证"],
+    # Review 是可选分支；实现完成后可直接进入测试验证。
+    "测试验证": ["编码实现", "代码检查", "测试验证"],
     "交付完成": ["测试验证", "交付完成"],
 }
 SCHEMA_TEMPLATE = """-- GGG_SQL_SCHEMA_VERSION: 3
@@ -117,8 +118,10 @@ def main() -> None:
     parser.add_argument("--to-phase", required=True, choices=PHASES, help="目标阶段")
     parser.add_argument("--design-confirmed", action="store_true", help="推进到任务拆分时标记方案已确认")
     parser.add_argument("--tasks-confirmed", action="store_true", help="推进到编码实现时标记任务拆分已确认")
-    parser.add_argument("--implementation-completed", action="store_true", help="推进到代码检查时标记编码实现已完成")
-    parser.add_argument("--review-passed", action="store_true", help="推进到测试验证时标记代码检查已通过")
+    parser.add_argument("--implementation-completed", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--review-disposition", choices=["light", "formal"], help=argparse.SUPPRESS)
+    parser.add_argument("--review-passed", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--review-gate-satisfied", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--test-passed", action="store_true", help="旧命令兼容参数；新版使用 test-mark 登记测试结论")
     parser.add_argument("--business-model-confirmed", action="store_true", help="允许生成 schema 的前提：业务模型已确认")
     parser.add_argument("--upstream-contract-confirmed", action="store_true", help="允许生成 schema 的前提：上下游契约已确认")
@@ -129,6 +132,7 @@ def main() -> None:
     repo_root = detect_repo_root(feature_dir)
     workflow_root = detect_workflow_root(repo_root)
     meta = load_meta(feature_dir)
+    workflow_schema_version = int(meta.get("workflow_schema_version", 1))
     templates_dir = (
         Path(__file__).resolve().parent.parent / "assets" / "workflow" / "templates"
         if int(meta.get("workflow_schema_version", 1)) >= 3
@@ -151,6 +155,11 @@ def main() -> None:
         meta["current_status"] = "调研中"
 
     elif target_phase == "技术方案":
+        if workflow_schema_version >= 5 and args.create_schema:
+            raise SystemExit(
+                "新版流程不在技术方案阶段首次创建 SQL；"
+                "请回到需求对齐填写 sql-draft.sql 并执行 confirm-sql"
+            )
         if current_phase == "需求对齐" and args.create_schema:
             raise SystemExit("请先进入技术方案并完成 02-design.md 预检，再重新执行 --create-schema")
         if current_phase == "技术方案" and args.create_schema:
@@ -166,6 +175,10 @@ def main() -> None:
             fail_with_validation_errors(validation_errors, "当前需求在进入技术方案前未通过校验")
         if review_flags.get("alignment_needs_review"):
             raise SystemExit("需求对齐结果待重审，不能进入技术方案阶段")
+        if workflow_schema_version >= 5 and not meta.get("gates", {}).get("sql_confirmed"):
+            raise SystemExit(
+                "SQL Gate 尚未完成；查询、DML、DDL 或“无 SQL”都必须先执行 confirm-sql"
+            )
 
         research_text = (feature_dir / "01-research.md").read_text(encoding="utf-8")
         unresolved = validator.unresolved_research_questions(research_text)
@@ -220,16 +233,16 @@ def main() -> None:
         copy_if_missing(templates_dir / "implementation-log-template.md", feature_dir / "05-implementation-log.md")
         meta.setdefault("gates", {})["tasks_confirmed"] = True
         meta["gates"]["implementation_completed"] = False
-        meta["gates"]["review_passed"] = False
+        meta["gates"].pop("review_passed", None)
+        meta["gates"].pop("review_gate_satisfied", None)
+        meta.pop("review_disposition", None)
+        meta["review_status"] = "not_run"
         meta["gates"]["test_passed"] = False
         meta["gates"]["release_ready"] = False
         meta["current_phase"] = "编码实现"
         meta["current_status"] = "编码中"
 
     elif target_phase == "代码检查":
-        if not args.implementation_completed:
-            raise SystemExit("推进到代码检查阶段必须显式确认 implementation 已完成")
-
         implementation_log = feature_dir / "05-implementation-log.md"
         if not implementation_log.exists():
             raise SystemExit("缺少 05-implementation-log.md，不能进入代码检查阶段")
@@ -242,62 +255,52 @@ def main() -> None:
             raise SystemExit("实现完成后代码又发生变化；请重新开启 implementation 轮次并完成质量门禁")
         completion_errors = validator.validate_implementation_completion(implementation_log)
         fail_with_validation_errors(completion_errors, "编码实现质量门禁未通过")
-        validation_errors = validator.validate_feature_dir(feature_dir)
-        fail_with_validation_errors(validation_errors, "当前需求在进入代码检查前未通过校验")
-
         copy_if_missing(templates_dir / "code-review-index-template.md", feature_dir / "06-code-review.md")
-        (feature_dir / "review-rounds").mkdir(exist_ok=True)
+        review_report = feature_dir / "06-code-review.md"
+        if validator.review_schema_version(review_report.read_text(encoding="utf-8")) < 2:
+            raise SystemExit("06-code-review.md 是旧版复杂 Review 工件；请保留历史文件并改用新版模板")
+        implementation_session.update_record_line(
+            review_report,
+            "- 对应实现轮次：",
+            implementation_state.get("round", ""),
+        )
+        implementation_session.update_record_line(
+            review_report,
+            "- 实现差异指纹：",
+            current_snapshot.get("fingerprint", ""),
+        )
         meta.setdefault("gates", {})["implementation_completed"] = True
-        meta["gates"]["review_passed"] = False
+        meta["gates"].pop("review_passed", None)
+        meta["gates"].pop("review_gate_satisfied", None)
+        meta.pop("review_disposition", None)
+        meta["review_status"] = "in_progress"
         meta["gates"]["test_passed"] = False
         meta["gates"]["release_ready"] = False
         meta["current_phase"] = "代码检查"
         meta["current_status"] = "检查中"
 
     elif target_phase == "测试验证":
-        if not args.review_passed:
-            raise SystemExit("推进到测试验证阶段必须显式确认 review 已通过")
-
-        code_review = feature_dir / "06-code-review.md"
-        if not code_review.exists():
-            raise SystemExit("缺少 06-code-review.md，不能进入测试验证阶段")
         implementation_log = feature_dir / "05-implementation-log.md"
+        if not implementation_log.exists():
+            raise SystemExit("缺少 05-implementation-log.md，不能进入测试验证阶段")
         implementation_state = implementation_session.load_state(implementation_log)
-        review_state = implementation_state.get("review") or {}
+        if implementation_state.get("status") != "completed":
+            raise SystemExit("实现会话尚未完成，不能进入测试验证阶段")
         current_snapshot = implementation_session.current_snapshot(implementation_state)
-        if review_state.get("result") != "passed":
-            raise SystemExit("当前实现轮次尚未登记通过的 Review 结论，不能进入测试验证阶段")
-        review_binding_errors = implementation_session.current_review_binding_errors(
-            implementation_log,
-            implementation_state,
-            current_snapshot,
-        )
-        fail_with_validation_errors(
-            review_binding_errors,
-            "Review 绑定已失效，不能进入测试验证阶段",
-        )
-        repositories = current_snapshot.get("repositories", [])
-        multi_repo = len(repositories) > 1
-        actual_paths = {
-            f"{repository['label']}/{item['path']}" if multi_repo else item["path"]
-            for repository in repositories
-            for item in repository.get("files", [])
-        }
-        review_completion_errors = validator.validate_code_review_completion(
-            code_review,
-            feature_dir / "review-rounds",
-            actual_paths=actual_paths,
-            expected_implementation_round=implementation_state.get("round", ""),
-            expected_fingerprint=current_snapshot.get("fingerprint", ""),
-            expected_input_fingerprint=review_state.get("input_fingerprint", ""),
-        )
-        fail_with_validation_errors(review_completion_errors, "Code Review 质量门禁未通过")
+        completed_snapshot = implementation_state.get("completion_snapshot") or {}
+        if current_snapshot.get("fingerprint") != completed_snapshot.get("fingerprint"):
+            raise SystemExit("实现完成后代码又发生变化；请重新完成 implementation 轮次")
+        completion_errors = validator.validate_implementation_completion(implementation_log)
+        fail_with_validation_errors(completion_errors, "编码实现质量门禁未通过")
         validation_errors = validator.validate_feature_dir(feature_dir)
         fail_with_validation_errors(validation_errors, "当前需求在进入测试验证前未通过校验")
 
         copy_if_missing(templates_dir / "test-report-index-template.md", feature_dir / "07-test-report.md")
         (feature_dir / "test-rounds").mkdir(exist_ok=True)
-        meta.setdefault("gates", {})["review_passed"] = True
+        meta.setdefault("gates", {})["implementation_completed"] = True
+        meta["gates"].pop("review_passed", None)
+        meta["gates"].pop("review_gate_satisfied", None)
+        meta.pop("review_disposition", None)
         meta["gates"]["test_passed"] = False
         meta["gates"]["release_ready"] = False
         meta["current_phase"] = "测试验证"

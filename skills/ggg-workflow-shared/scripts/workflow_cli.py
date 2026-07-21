@@ -29,6 +29,18 @@ def main() -> None:
         help="项目根目录；默认当前 Git 仓库根目录，非 Git 目录时使用当前目录",
     )
     init_parser.add_argument("--feature-name", required=True, help="需求名称")
+    init_parser.add_argument(
+        "--recommended-mode",
+        required=True,
+        choices=["quick", "full"],
+        help="AI 推荐模式；只记录推荐，不代替用户选择",
+    )
+    init_parser.add_argument("--recommendation-reason", required=True, help="AI 推荐依据")
+    init_parser.add_argument(
+        "--selection-source",
+        required=True,
+        help="用户选择 full 或明确授权 AI 决定的消息定位",
+    )
     init_parser.add_argument("--date", help="目录日期，格式 YYYYMMDD")
     init_parser.add_argument("--refresh-workflow-assets", action="store_true", help="覆盖同步 ggg/workflow 下的共享 README 和模板")
 
@@ -38,6 +50,18 @@ def main() -> None:
         help="项目根目录；默认当前 Git 仓库根目录，非 Git 目录时使用当前目录",
     )
     quick_parser.add_argument("--quick-name", required=True, help="quick 小需求名称")
+    quick_parser.add_argument(
+        "--recommended-mode",
+        required=True,
+        choices=["quick", "full"],
+        help="AI 推荐模式；只记录推荐，不代替用户选择",
+    )
+    quick_parser.add_argument("--recommendation-reason", required=True, help="AI 推荐依据")
+    quick_parser.add_argument(
+        "--selection-source",
+        required=True,
+        help="用户选择 quick 或明确授权 AI 决定的消息定位",
+    )
     quick_parser.add_argument("--date", help="目录日期，格式 YYYYMMDD")
     quick_parser.add_argument("--create-schema", action="store_true", help="按需创建 04-schema.sql")
     quick_parser.add_argument("--interface-name", action="append", default=[], help="按需创建接口明细，可重复")
@@ -52,9 +76,19 @@ def main() -> None:
     confirm_baseline_parser.add_argument("--feature-dir", required=True, help="需求目录")
     confirm_baseline_parser.add_argument("--source", required=True, help="用户最终确认的消息定位或时间")
 
-    confirm_schema_parser = subparsers.add_parser("confirm-schema", help="用户确认 SQL 后锁定 04-schema.sql 内容指纹")
+    confirm_schema_parser = subparsers.add_parser(
+        "confirm-schema",
+        help="旧版需求兼容：锁定 04-schema.sql 内容指纹",
+    )
     confirm_schema_parser.add_argument("--feature-dir", required=True, help="需求目录")
     confirm_schema_parser.add_argument("--source", required=True, help="用户确认 SQL 的消息定位或时间")
+
+    confirm_sql_parser = subparsers.add_parser(
+        "confirm-sql",
+        help="技术方案前锁定查询、DML、DDL 或无 SQL 的语义指纹",
+    )
+    confirm_sql_parser.add_argument("--feature-dir", required=True, help="需求目录")
+    confirm_sql_parser.add_argument("--source", required=True, help="用户确认 SQL 影响的消息定位或时间")
 
     validate_parser = subparsers.add_parser("validate", help="按当前阶段校验需求目录")
     validate_parser.add_argument("--feature-dir", required=True, help="需求目录")
@@ -86,6 +120,18 @@ def main() -> None:
         help="接管启动前已属于本需求的 Git 脏文件；单仓可用相对路径，多仓必须用绝对路径，可重复",
     )
     implementation_start_parser.add_argument(
+        "--diff-range",
+        action="append",
+        default=[],
+        help="接管已提交实现的 BASE..TARGET；多仓按 --repo-root 顺序重复传入",
+    )
+    implementation_start_parser.add_argument(
+        "--adopt-commit",
+        action="append",
+        default=[],
+        help="接管单个已提交实现；多仓按 --repo-root 顺序重复传入",
+    )
+    implementation_start_parser.add_argument(
         "--task",
         action="append",
         default=[],
@@ -113,6 +159,12 @@ def main() -> None:
     )
     implementation_verify_parser.add_argument("--cwd", help="验证命令工作目录；默认第一个已声明仓库")
     implementation_verify_parser.add_argument("--label", help="验证用途，例如 compile、unit-test")
+    implementation_verify_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=60,
+        help="一次性验证进程超时秒数；默认 60，超时回收完整进程组",
+    )
     implementation_verify_parser.add_argument(
         "verification_command",
         nargs=argparse.REMAINDER,
@@ -152,33 +204,37 @@ def main() -> None:
 
     review_mark_parser = subparsers.add_parser(
         "review-mark",
-        help="将 Review 结论及评审方式绑定到当前实现轮次和差异指纹",
+        help="登记可选 Review 的需求偏差、代码质量与格式结论",
     )
     review_mark_parser.add_argument("--record", required=True, help="05-implementation-log.md 或 quick.md 路径")
     review_mark_parser.add_argument("--result", required=True, choices=["passed", "needs_changes", "blocked"])
     review_mark_parser.add_argument(
-        "--reviewer-mode",
-        choices=["fresh-review", "self-review"],
-        help=(
-            "明确本轮是否由无实现历史的 fresh reviewer 执行；"
-            "旧调用省略时安全降级为 self-review"
-        ),
+        "--disposition",
+        choices=["light", "formal"],
+        help=argparse.SUPPRESS,
     )
     review_mark_parser.add_argument(
-        "--self-review-reason",
-        help="仅 self-review 必填：fresh reviewer 不可用或启动失败的具体原因",
+        "--reviewer-mode",
+        choices=["fresh-review", "self-review"],
+        help=argparse.SUPPRESS,
     )
+    review_mark_parser.add_argument("--self-review-reason", help=argparse.SUPPRESS)
 
     review_status_parser = subparsers.add_parser(
         "review-status",
-        help="检查 Review 结论是否仍对应当前实现差异",
+        help="查看可选 Review 是否执行及其结论；未执行不影响测试",
     )
     review_status_parser.add_argument("--record", required=True, help="05-implementation-log.md 或 quick.md 路径")
-    review_status_parser.add_argument("--require-passed", action="store_true")
+    review_status_parser.add_argument("--require-passed", action="store_true", help=argparse.SUPPRESS)
+    review_status_parser.add_argument(
+        "--require-gate-satisfied",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
     test_run_parser = subparsers.add_parser(
         "test-run",
-        help="无 shell 执行自动化测试，并生成绑定当前实现、Review 和 TSxx 的机器证据",
+        help="无 shell 执行自动化测试，并生成绑定当前实现和 TSxx 的机器证据",
     )
     test_run_parser.add_argument("--record", required=True, help="05-implementation-log.md 或 quick.md 路径")
     test_run_parser.add_argument("--round", required=True, help="当前测试轮次 Txx；quick 使用 quick")
@@ -201,7 +257,7 @@ def main() -> None:
         "--effect-authorization",
         help="data-write 及更高副作用命令的用户授权定位",
     )
-    test_run_parser.add_argument("--timeout-seconds", type=int, default=300)
+    test_run_parser.add_argument("--timeout-seconds", type=int, default=60)
     test_run_parser.add_argument(
         "test_command",
         nargs=argparse.REMAINDER,
@@ -228,9 +284,16 @@ def main() -> None:
     scan_parser.add_argument("--max-depth", type=int, default=8, help="目录深度上限")
     scan_parser.add_argument("--limit", type=int, default=20, help="每类结果最多输出多少行")
 
-    design_parser = subparsers.add_parser("to-design", help="进入技术方案；完成预检后可按需创建 04-schema.sql")
+    design_parser = subparsers.add_parser(
+        "to-design",
+        help="SQL Gate 有效后进入技术方案；--create-schema 仅供旧版需求兼容",
+    )
     design_parser.add_argument("--feature-dir", required=True, help="需求目录")
-    design_parser.add_argument("--create-schema", action="store_true", help="同时创建 04-schema.sql")
+    design_parser.add_argument(
+        "--create-schema",
+        action="store_true",
+        help="仅旧版需求：在原方案预检后创建 04-schema.sql",
+    )
     design_parser.add_argument("--business-model-confirmed", action="store_true", help="确认关键业务模型")
     design_parser.add_argument("--upstream-contract-confirmed", action="store_true", help="确认关键上下游契约")
 
@@ -242,13 +305,18 @@ def main() -> None:
     implementation_parser.add_argument("--feature-dir", required=True, help="需求目录")
     implementation_parser.add_argument("--tasks-confirmed", action="store_true", help="确认任务拆分已通过")
 
-    review_parser = subparsers.add_parser("to-review", help="推进到代码检查阶段，解锁 06-code-review.md")
+    review_parser = subparsers.add_parser(
+        "to-review",
+        help="用户明确要求 Review 时进入可选代码检查并创建一份简洁工件",
+    )
     review_parser.add_argument("--feature-dir", required=True, help="需求目录")
-    review_parser.add_argument("--implementation-completed", action="store_true", help="确认编码实现已完成")
+    review_parser.add_argument("--implementation-completed", action="store_true", help=argparse.SUPPRESS)
+    review_parser.add_argument("--review-disposition", choices=["light", "formal"], help=argparse.SUPPRESS)
 
-    test_parser = subparsers.add_parser("to-test", help="推进到测试验证阶段，解锁 07-test-report.md")
+    test_parser = subparsers.add_parser("to-test", help="实现完成后推进到测试验证；Review 可选")
     test_parser.add_argument("--feature-dir", required=True, help="需求目录")
-    test_parser.add_argument("--review-passed", action="store_true", help="确认代码检查已通过")
+    test_parser.add_argument("--review-passed", action="store_true", help=argparse.SUPPRESS)
+    test_parser.add_argument("--review-gate-satisfied", action="store_true", help=argparse.SUPPRESS)
 
     complete_parser = subparsers.add_parser(
         "complete",
@@ -260,7 +328,7 @@ def main() -> None:
     clarify_parser = subparsers.add_parser("sync-clarification", help="同步新增澄清的影响到 meta.json")
     clarify_parser.add_argument("--feature-dir", required=True, help="需求目录")
     clarify_parser.add_argument("--impact", nargs="+", required=True,
-                                choices=["baseline", "research", "design", "schema", "tasks"],
+                                choices=["baseline", "research", "sql", "design", "schema", "tasks"],
                                 help="本次澄清影响范围，可多选")
     clarify_parser.add_argument("--source", default="用户澄清", help="澄清来源")
     clarify_parser.add_argument("--summary", required=True, help="澄清摘要")
@@ -277,7 +345,16 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "init":
-        extra_args = ["--feature-name", args.feature_name]
+        extra_args = [
+            "--feature-name",
+            args.feature_name,
+            "--recommended-mode",
+            args.recommended_mode,
+            "--recommendation-reason",
+            args.recommendation_reason,
+            "--selection-source",
+            args.selection_source,
+        ]
         if args.repo_root:
             extra_args.extend(["--repo-root", args.repo_root])
         if args.date:
@@ -286,7 +363,16 @@ def main() -> None:
             extra_args.append("--refresh-workflow-assets")
         code = run_script("init_feature_docs.py", extra_args)
     elif args.command == "init-quick":
-        extra_args = ["--quick-name", args.quick_name]
+        extra_args = [
+            "--quick-name",
+            args.quick_name,
+            "--recommended-mode",
+            args.recommended_mode,
+            "--recommendation-reason",
+            args.recommendation_reason,
+            "--selection-source",
+            args.selection_source,
+        ]
         if args.repo_root:
             extra_args.extend(["--repo-root", args.repo_root])
         if args.date:
@@ -310,6 +396,11 @@ def main() -> None:
             "confirm_schema.py",
             ["--feature-dir", args.feature_dir, "--source", args.source],
         )
+    elif args.command == "confirm-sql":
+        code = run_script(
+            "confirm_sql.py",
+            ["--feature-dir", args.feature_dir, "--source", args.source],
+        )
     elif args.command == "validate":
         code = run_script("validate_feature_docs.py", ["--feature-dir", args.feature_dir])
     elif args.command == "quality-gate":
@@ -326,13 +417,23 @@ def main() -> None:
             extra_args.extend(["--repo-root", repo_root])
         for adopted_file in args.adopt_existing_file:
             extra_args.extend(["--adopt-existing-file", adopted_file])
+        for diff_range in args.diff_range:
+            extra_args.extend(["--diff-range", diff_range])
+        for commit in args.adopt_commit:
+            extra_args.extend(["--adopt-commit", commit])
         for task_id in args.task:
             extra_args.extend(["--task", task_id])
         code = run_script("implementation_session.py", extra_args)
     elif args.command == "implementation-precheck":
         code = run_script("implementation_session.py", ["precheck", "--record", args.record])
     elif args.command == "implementation-verify":
-        extra_args = ["verify", "--record", args.record]
+        extra_args = [
+            "verify",
+            "--record",
+            args.record,
+            "--timeout-seconds",
+            str(args.timeout_seconds),
+        ]
         if args.cwd:
             extra_args.extend(["--cwd", args.cwd])
         if args.label:
@@ -360,6 +461,8 @@ def main() -> None:
             "--result",
             args.result,
         ]
+        if args.disposition:
+            extra_args.extend(["--disposition", args.disposition])
         if args.reviewer_mode:
             extra_args.extend(["--reviewer-mode", args.reviewer_mode])
         if args.self_review_reason:
@@ -369,6 +472,8 @@ def main() -> None:
         extra_args = ["review-status", "--record", args.record]
         if args.require_passed:
             extra_args.append("--require-passed")
+        if args.require_gate_satisfied:
+            extra_args.append("--require-gate-satisfied")
         code = run_script("implementation_session.py", extra_args)
     elif args.command == "test-run":
         extra_args = [
@@ -437,14 +542,15 @@ def main() -> None:
             extra_args.append("--tasks-confirmed")
         code = run_script("advance_feature_phase.py", extra_args)
     elif args.command == "to-review":
-        extra_args = ["--feature-dir", args.feature_dir, "--to-phase", "代码检查"]
-        if args.implementation_completed:
-            extra_args.append("--implementation-completed")
+        extra_args = [
+            "--feature-dir",
+            args.feature_dir,
+            "--to-phase",
+            "代码检查",
+        ]
         code = run_script("advance_feature_phase.py", extra_args)
     elif args.command == "to-test":
         extra_args = ["--feature-dir", args.feature_dir, "--to-phase", "测试验证"]
-        if args.review_passed:
-            extra_args.append("--review-passed")
         code = run_script("advance_feature_phase.py", extra_args)
     elif args.command == "complete":
         if not args.test_passed:

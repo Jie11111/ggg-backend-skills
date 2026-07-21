@@ -1,4 +1,4 @@
 interface:
   display_name: "GGG Java Coding Standard"
-  short_description: "统一 Java 后端代码设计、实现、验证与评审共享规范"
-  default_prompt: "使用 $ggg-java-coding-standard 按统一规范设计并编写 Java 后端代码。"
+  short_description: "统一 ID 精度、字段注释、异常日志与 Trace 规范"
+  default_prompt: "使用 $ggg-java-coding-standard 编写 Java 后端代码，确保大整数 ID 不丢精度、接口字段有注释、异常日志和 Trace 完整，且默认不新增测试类。"

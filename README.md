@@ -1,9 +1,11 @@
 # ggg-backend-skills
 
-一套轻量但可验证的 Java 后端开发 Skills。GGG 会根据需求影响面自动选择：
+一套轻量但可验证的 Java 后端开发 Skills。GGG 会根据需求影响面推荐 `quick/full`，最终模式由用户选择：
 
-- `quick`：小改动走最小闭环，保留边界、实现、Review 与验证证据。
-- `full`：复杂或高风险需求依次完成需求、调研、设计、拆分、实现、Review 与测试。
+- `quick`：小改动走最小闭环，保留边界、实现和必要验证证据。
+- `full`：复杂或高风险需求依次完成需求、调研、SQL 确认、设计、拆分、实现和测试。
+
+Review 对 quick/full 都是可选动作：只在用户明确要求时检查“代码与需求偏差”和“代码质量与格式”，未执行或发现问题都不会机械阻塞测试。
 
 ## 七个流程阶段
 
@@ -12,7 +14,7 @@
 3. `ggg-technical-design`：形成可直接实现的技术方案。
 4. `ggg-task-breakdown`：拆成有代码落点和完成标准的任务。
 5. `ggg-implementation`：按已确认边界实现并冻结完成快照。
-6. `ggg-code-review`：基于真实差异完成需求符合性和代码质量检查。
+6. `ggg-code-review`：可选；基于真实差异检查需求偏差、代码质量与格式。
 7. `ggg-test-verify`：按风险执行测试并保存可复跑证据。
 
 ## 必要共享依赖
@@ -40,11 +42,11 @@ Copy-Item -Recurse .\skills\* "$env:USERPROFILE\.codex\skills\"
 
 ## 使用
 
-需求统一从 `$ggg-prd-intake` 进入。普通表达即可，流程会自动判断 quick/full；只有模式冲突或关键依据不足时才询问。
+需求统一从 `$ggg-prd-intake` 进入。普通表达即可；AI 会先推荐 quick/full 并说明依据，但不会把推荐当成用户的最终选择。
 
 ```text
 $ggg-prd-intake
 为订单取消接口增加重复请求幂等处理。
 ```
 
-quick 需求不会机械生成完整文档；full 需求则按七阶段推进，并通过共享状态与差异指纹保证实现、Review、测试结论对应同一份代码快照。
+quick 需求不会机械生成完整文档；full 需求在 SQL 语义确认后才进入技术方案。默认不新增测试类；实现完成后可直接进入测试，测试命令使用一次性非 PTY 进程并设置超时。

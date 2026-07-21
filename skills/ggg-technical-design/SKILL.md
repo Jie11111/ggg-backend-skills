@@ -1,6 +1,6 @@
 ---
 name: ggg-technical-design
-description: 技术方案阶段。GGG 基于已闭合的需求基线和代码结论，设计可直接实现的 Java 后端方案，覆盖持久或无持久实例、HTTP/RPC/MQ/Job 契约、数据承载、SQL 变更、真实代码落点和验证风险。仅当用户明确指定 `$ggg-technical-design` 或明确要求开始、编写或调整技术方案时使用。
+description: 技术方案阶段。GGG 只在需求、代码事实和 SQL Gate 均已闭合后编写可直接实现的 Java 后端方案，覆盖持久或无持久实例、HTTP/RPC/MQ/Job 契约、数据承载、已确认 SQL、真实代码落点和验证风险，并维护统一接口设计索引。仅当用户明确指定 `$ggg-technical-design` 或明确要求开始、编写或调整技术方案时使用。
 ---
 
 # GGG Technical Design（技术方案）
@@ -28,6 +28,7 @@ description: 技术方案阶段。GGG 基于已闭合的需求基线和代码结
 - 需求对齐已完成且 validate 通过。
 - `01-research.md` 没有未解决的阻塞问题。
 - 业务目标、验收标准和关键代码事实足以作出设计。
+- SQL Gate 已满足：不涉及 SQL，或 `sql-draft.sql` 已由用户确认且当前语义指纹有效。
 
 条件不满足时只列缺口，不开始方案。
 
@@ -95,29 +96,26 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow
 
 只有跨系统、异步链路或复杂事务需要主时序图；普通单服务链路写清调用链即可，并注明不画图原因。
 
-### 5. 按风险处理 SQL
+### 5. 引用已确认 SQL
 
-涉及 MySQL 结构变更时，必须先完整读取 `references/sql-design-checklist.md`，再创建和填写 `04-schema.sql`：
+技术方案不得在本阶段第一次设计 SQL。读取 `01-research.md` 的 SQL Gate 和已确认的 `sql-draft.sql`：
 
-```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow_cli.py" to-design --feature-dir <需求目录> --create-schema --business-model-confirmed --upstream-contract-confirmed
+- `02-design.md` 只说明 SQL 的业务理由、真实代码落点、事务/并发、兼容、回滚和验证，并引用确认来源与语义指纹。
+- 查询或 DML 必须保持已确认的表、JOIN、字段、过滤、排序、分页和更新条件。
+- DDL 必须保持已确认的字段类型、默认值、主键、索引、约束和完整结构。
+- 仅别名、空白和格式变化不触发重新确认；任何 SQL 语义变化必须先执行 `sync-clarification --impact sql design tasks`，回到 SQL Gate。若代码调研结论本身也变化，再同时加入 `research`。历史需求仍按原 `schema` 影响项兼容处理。
+- 旧需求仍可继续使用已确认的 `04-schema.sql`；新需求以 `sql-draft.sql` 为 SQL 唯一真相。
+
+### 6. 维护接口设计和按需明细
+
+在 `02-design.md` 的“八、接口设计”中维护唯一接口索引，表头固定为：
+
+```markdown
+| 接口名称 | 新增/修改 | 请求方式 | 路径/方法 | 所属项目 | 接口文档地址 | 备注 |
+|---|---|---|---|---|---|---|
 ```
 
-- `04-schema.sql` 是字段类型、默认值、主键、唯一键、索引和完整 DDL 的唯一真相。
-- `02-design.md` 只写变更理由、业务事实、核心写入/查询、兼容顺序、历史数据、回滚和验证，并引用 Dxx/Cxx。
-- 每条结构 DDL 前必须有一条 `GGG_DDL_OBJECT` JSON，准确登记对象、操作、字段/索引/约束覆盖、风险与依据、Cxx 和 Dxx；主方案按对象与它双向精确闭环。
-- 普通 DDL 与完整方案、契约可同轮迭代；进入任务拆分前统一展示并确认。
-- 高风险 DDL 必须先完成 §0-§5 并展示风险和 DDL；获得用户明确确认前，不填写依赖该结构的 §6-§16 或接口明细。
-
-用户确认后执行：
-
-```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow_cli.py" confirm-schema --feature-dir <需求目录> --source "<用户确认消息或时间>"
-```
-
-`04-schema.sql` 后续变化会使确认失效，必须重新确认。不涉及 MySQL 结构变更时不创建该文件，在方案中说明原因。
-
-### 6. 按需创建接口明细
+§三只负责调用方、可信字段和契约边界，§八只负责接口索引，不重复参数细节。
 
 只有外部、公共或复杂契约需要 `interface-details/`：
 
@@ -141,7 +139,8 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow
 - 所有设计输入已闭环，关键 Dxx 均有有效 Cxx。
 - 核心改动有真实代码落点。
 - 必要契约明细已闭环；未触发时没有空目录或占位文档。
-- 存在 `04-schema.sql` 时已经确认且当前指纹有效。
+- 新版 SQL Gate 已确认且当前指纹有效；历史需求存在 `04-schema.sql` 时仍按 legacy 指纹校验。
+- SQL Gate 仍与当前 `01-research.md`、`sql-draft.sql` 和确认指纹一致。
 - 没有未解决的阻塞问题或残留模板内容。
 
 需要用户授权的业务取舍、成本、公共契约或高风险变更，必须展示方案并获得明确确认。低风险、事实已闭合且用户已经授权连续推进时，给出精简方案摘要后可直接进入任务拆分，不再额外索要一次形式化确认。随后由 `$ggg-task-breakdown` 执行：
@@ -152,7 +151,7 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow
 
 ## 用户纠正
 
-- 只影响方案：更新 `02-design.md`、按需更新 `04-schema.sql` 或接口明细。
+- 只影响方案且不改变 SQL 语义：更新 `02-design.md` 或接口明细。改变 SQL 语义时先更新 `sql-draft.sql` 并重走 SQL Gate；历史需求按需更新 `04-schema.sql`。
 - 影响代码事实：回写 `01-research.md` 后重审相关 Dxx。
 - 影响业务范围、规则、实例身份或验收标准：执行 `sync-clarification --impact baseline research design`，重新确认上游后继续。
 
@@ -166,7 +165,7 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/ggg-workflow-shared/scripts/workflow
 - 普通工程取舍由 AI 推荐；只有业务、成本、兼容或发布风险需要用户授权。
 - 不为未来可能、排查方便或抽象美观增加持久化、中间件、服务或字段。
 - 无持久实例、简单内部契约或单服务链路只写一次具体原因，不展开完整身份字段、非 MySQL 明细、接口明细或时序图。
-- 存在 MySQL 结构变更时，未确认当前 `04-schema.sql` 不得进入任务拆分。
+- SQL Gate 未确认或已失效时不得开始或完成技术方案。
 - 本阶段不生成 `03-tasks.md`，不写业务代码。
 
 ## 完成标准

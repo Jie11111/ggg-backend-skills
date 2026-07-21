@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workflow_contracts import PUBLIC_PHASES, REVIEW_FLAG_KEYS
 
 
-IMPACT_CHOICES = ["baseline", "research", "design", "schema", "tasks"]
+IMPACT_CHOICES = ["baseline", "research", "sql", "design", "schema", "tasks"]
 STATUS_PRIORITY = {
     "待重审": 1,
     "待澄清": 2,
@@ -40,12 +40,12 @@ def ensure_defaults(meta: dict) -> tuple[dict, dict]:
         "design_confirmed": False,
         "tasks_confirmed": False,
         "implementation_completed": False,
-        "review_passed": False,
         "test_passed": False,
         "release_ready": False,
         "business_model_confirmed": False,
         "upstream_contract_confirmed": False,
         "schema_confirmed": False,
+        "sql_confirmed": False,
     }
     gates = meta.setdefault(
         "gates",
@@ -101,6 +101,17 @@ def reset_schema_confirmation(meta: dict, gates: dict) -> None:
     confirmation["confirmed_at"] = ""
 
 
+def reset_sql_confirmation(meta: dict, gates: dict) -> None:
+    gates["sql_confirmed"] = False
+    confirmation = meta.setdefault("sql_confirmation", {})
+    confirmation["impact_type"] = ""
+    confirmation["research_semantic_fingerprint"] = ""
+    confirmation["draft_semantic_fingerprint"] = ""
+    confirmation["semantic_fingerprint"] = ""
+    confirmation["confirmation_source"] = ""
+    confirmation["confirmed_at"] = ""
+
+
 def bump_status(meta: dict, new_status: str) -> None:
     current_status = str(meta.get("current_status", "")).strip()
     if STATUS_PRIORITY.get(new_status, 0) >= STATUS_PRIORITY.get(current_status, 0):
@@ -118,13 +129,11 @@ def reset_downstream_gates(gates: dict, from_phase: str) -> None:
         gates["design_confirmed"] = False
         gates["tasks_confirmed"] = False
         gates["implementation_completed"] = False
-        gates["review_passed"] = False
         gates["test_passed"] = False
         gates["release_ready"] = False
     elif from_phase == "tasks":
         gates["tasks_confirmed"] = False
         gates["implementation_completed"] = False
-        gates["review_passed"] = False
         gates["test_passed"] = False
         gates["release_ready"] = False
 
@@ -155,12 +164,12 @@ def reset_from_baseline(gates: dict) -> None:
     gates["design_confirmed"] = False
     gates["tasks_confirmed"] = False
     gates["implementation_completed"] = False
-    gates["review_passed"] = False
     gates["test_passed"] = False
     gates["release_ready"] = False
     gates["business_model_confirmed"] = False
     gates["upstream_contract_confirmed"] = False
     gates["schema_confirmed"] = False
+    gates["sql_confirmed"] = False
 
 
 def main() -> None:
@@ -191,6 +200,16 @@ def main() -> None:
     schema_confirmation = meta.setdefault("schema_confirmation", {})
     for key in ["confirmed_schema_sha256", "confirmation_source", "confirmed_at"]:
         schema_confirmation.setdefault(key, "")
+    sql_confirmation = meta.setdefault("sql_confirmation", {})
+    for key in [
+        "impact_type",
+        "research_semantic_fingerprint",
+        "draft_semantic_fingerprint",
+        "semantic_fingerprint",
+        "confirmation_source",
+        "confirmed_at",
+    ]:
+        sql_confirmation.setdefault(key, "")
     impacts = sorted(set(args.impact))
     phase = meta.get("current_phase", "需求受理")
 
@@ -203,6 +222,7 @@ def main() -> None:
         meta["workflow_schema_version"] = max(3, baseline_schema_version, int(meta.get("workflow_schema_version", 1)))
         reset_from_baseline(gates)
         reset_schema_confirmation(meta, gates)
+        reset_sql_confirmation(meta, gates)
         reopen_baseline_confirmation(feature_dir / "00-baseline.md")
         clarification = meta["clarification"]
         clarification["confirmed_baseline_sha256"] = ""
@@ -219,6 +239,7 @@ def main() -> None:
         review_flags["alignment_needs_review"] = True
         gates["alignment_completed"] = False
         reset_schema_confirmation(meta, gates)
+        reset_sql_confirmation(meta, gates)
         bump_status(meta, "待澄清")
 
     if "design" in impacts:
@@ -233,6 +254,14 @@ def main() -> None:
         review_flags["design_needs_review"] = True
         reset_downstream_gates(gates, "design")
         reset_schema_confirmation(meta, gates)
+        reset_sql_confirmation(meta, gates)
+        bump_status(meta, "待重审")
+        if phase_reached(phase, "任务拆分") and (feature_dir / "03-tasks.md").exists():
+            review_flags["tasks_needs_review"] = True
+    if "sql" in impacts:
+        review_flags["design_needs_review"] = True
+        reset_downstream_gates(gates, "design")
+        reset_sql_confirmation(meta, gates)
         bump_status(meta, "待重审")
         if phase_reached(phase, "任务拆分") and (feature_dir / "03-tasks.md").exists():
             review_flags["tasks_needs_review"] = True
@@ -245,6 +274,7 @@ def main() -> None:
     if args.business_model_changed:
         gates["business_model_confirmed"] = False
         reset_schema_confirmation(meta, gates)
+        reset_sql_confirmation(meta, gates)
         reset_downstream_gates(gates, "design")
         review_flags["design_needs_review"] = True
         bump_status(meta, "待重审")
@@ -252,6 +282,7 @@ def main() -> None:
     if args.upstream_contract_changed:
         gates["upstream_contract_confirmed"] = False
         reset_schema_confirmation(meta, gates)
+        reset_sql_confirmation(meta, gates)
         reset_downstream_gates(gates, "design")
         review_flags["design_needs_review"] = True
         bump_status(meta, "待重审")
@@ -262,6 +293,12 @@ def main() -> None:
     clarification["last_summary"] = args.summary
     clarification["last_updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     clarification["last_impacts"] = impacts
+
+    gates.pop("review_passed", None)
+    gates.pop("review_gate_satisfied", None)
+    meta.pop("review_disposition", None)
+    if phase_reached(phase, "编码实现"):
+        meta["review_status"] = "stale"
 
     save_meta(meta_path, meta)
     print("[OK] 已同步澄清影响")

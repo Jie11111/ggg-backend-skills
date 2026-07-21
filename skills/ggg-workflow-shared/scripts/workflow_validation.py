@@ -15,27 +15,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workflow_contracts import (
     ALL_PHASES,
     BASELINE_REQUIRED_TOKENS,
+    BASELINE_V5_REQUIRED_TOKENS,
     CANONICAL_STAGE_FILES,
     CODE_REVIEW_INDEX_REQUIRED_TOKENS,
     CODE_REVIEW_ROUND_REQUIRED_TOKENS,
+    CODE_REVIEW_SIMPLE_REQUIRED_TOKENS,
     DESIGN_HARD_RESIDUAL_TOKENS,
     DESIGN_RISK_ONLY_TOKENS,
     DESIGN_REQUIRED_TOKENS,
     DESIGN_V4_REQUIRED_TOKENS,
     DESIGN_V5_REQUIRED_TOKENS,
+    DESIGN_V6_REQUIRED_TOKENS,
     IMPLEMENTATION_LOG_REQUIRED_TOKENS,
     INTERFACE_DETAIL_FILENAME,
     INTERFACE_DETAIL_REQUIRED_TOKENS,
     INTERFACE_DETAIL_V3_REQUIRED_TOKENS,
+    INTERFACE_DETAIL_V4_REQUIRED_TOKENS,
     LEGACY_RESEARCH_REQUIRED_TOKENS,
     PLACEHOLDER_TOKENS,
     PUBLIC_PHASES,
     RESEARCH_REQUIRED_TOKENS,
     RESEARCH_V2_REQUIRED_TOKENS,
+    RESEARCH_V3_REQUIRED_TOKENS,
     REVIEW_FLAG_KEYS,
     STAGE_FILE_ALIASES,
     TASK_REQUIRED_TOKENS,
     TASK_V2_REQUIRED_TOKENS,
+    TASK_V3_REQUIRED_TOKENS,
     TEST_REPORT_INDEX_REQUIRED_TOKENS,
     TEST_REPORT_ROUND_REQUIRED_TOKENS,
 )
@@ -282,6 +288,15 @@ def baseline_business_fingerprint(text: str) -> str:
         extract_line_value(text, "- 依赖项目："),
         extract_line_value(text, "- 依赖项目判断依据："),
     ]
+    if document_schema_version(text) >= 5:
+        basic_values.extend(
+            [
+                extract_line_value(text, "- 推荐模式："),
+                extract_line_value(text, "- 推荐依据："),
+                extract_line_value(text, "- 最终模式："),
+                extract_line_value(text, "- 模式选择来源："),
+            ]
+        )
     tracked_sections = [
         extract_section(text, "### 1.1 原始材料覆盖"),
         *(extract_section(text, f"## {index}. {title}") for index, title in [
@@ -314,8 +329,21 @@ def task_schema_version(text: str) -> int:
     return int(match.group(1)) if match else 1
 
 
+def implementation_schema_version(text: str) -> int:
+    match = re.search(
+        r"<!--\s*GGG_IMPLEMENTATION_SCHEMA_VERSION:\s*(\d+)\s*-->",
+        text,
+    )
+    return int(match.group(1)) if match else 1
+
+
 def quick_schema_version(text: str) -> int:
     match = re.search(r"<!--\s*GGG_QUICK_SCHEMA_VERSION:\s*(\d+)\s*-->", text)
+    return int(match.group(1)) if match else 1
+
+
+def review_schema_version(text: str) -> int:
+    match = re.search(r"<!--\s*GGG_REVIEW_SCHEMA_VERSION:\s*(\d+)\s*-->", text)
     return int(match.group(1)) if match else 1
 
 
@@ -329,6 +357,11 @@ def sql_schema_version(text: str) -> int:
     return int(match.group(1)) if match else 1
 
 
+def sql_draft_version(text: str) -> int:
+    match = re.search(r"(?mi)^\s*--\s*GGG_SQL_DRAFT_VERSION:\s*(\d+)\s*$", text)
+    return int(match.group(1)) if match else 0
+
+
 def interface_schema_version(text: str) -> int:
     match = re.search(r"<!--\s*GGG_INTERFACE_SCHEMA_VERSION:\s*(\d+)\s*-->", text)
     return int(match.group(1)) if match else 1
@@ -337,6 +370,479 @@ def interface_schema_version(text: str) -> int:
 def schema_fingerprint(text: str) -> str:
     normalized = "\n".join(line.rstrip() for line in text.splitlines()).strip() + "\n"
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+SQL_IMPACT_TYPES = {
+    "不涉及": "none",
+    "查询或DML": "query_dml",
+    "DDL": "ddl",
+}
+SQL_DRAFT_TYPES = {"SELECT", "INSERT", "UPDATE", "DELETE", "DDL"}
+SQL_DRAFT_MARKER_PATTERN = re.compile(
+    r"(?m)^[ \t]*--[ \t]*GGG_SQL:[ \t]*(\{.*\})[ \t]*$"
+)
+
+
+def research_sql_section(text: str) -> str:
+    return extract_section(text, "### 7.1 SQL 影响与确认准备")
+
+
+def research_sql_semantic_fingerprint(text: str) -> str:
+    """锁定 Research 中用户确认的 SQL 范围，排除确认动作自身回写字段。"""
+    section = research_sql_section(text)
+    retained = []
+    ignored_prefixes = {
+        "- SQL 确认状态：",
+        "- SQL 确认来源：",
+        "- SQL 语义指纹：",
+    }
+    for line in section.splitlines():
+        stripped = line.strip()
+        if any(stripped.startswith(prefix) for prefix in ignored_prefixes):
+            continue
+        retained.append(line.rstrip())
+    normalized = "\n".join(retained).strip() + "\n"
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def normalize_sql_semantics(text: str) -> str:
+    """忽略注释、大小写和空白，保留字符串、标识符和操作顺序。"""
+    output: list[str] = []
+    index = 0
+    state = "normal"
+    quote = ""
+    pending_space = False
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if state == "normal":
+            if char == "-" and next_char == "-":
+                state = "line_comment"
+                index += 2
+                continue
+            if char == "#":
+                state = "line_comment"
+                index += 1
+                continue
+            if char == "/" and next_char == "*":
+                state = "block_comment"
+                index += 2
+                continue
+            if char in {"'", '"', "`"}:
+                if pending_space and output and output[-1] != " ":
+                    output.append(" ")
+                pending_space = False
+                state = "quoted"
+                quote = char
+                output.append(char)
+                index += 1
+                continue
+            if char.isspace():
+                pending_space = True
+                index += 1
+                continue
+            if pending_space and output and output[-1] != " ":
+                output.append(" ")
+            pending_space = False
+            output.append(char.lower())
+            index += 1
+            continue
+        if state == "line_comment":
+            if char in "\r\n":
+                state = "normal"
+                pending_space = True
+            index += 1
+            continue
+        if state == "block_comment":
+            if char == "*" and next_char == "/":
+                state = "normal"
+                pending_space = True
+                index += 2
+            else:
+                index += 1
+            continue
+
+        output.append(char)
+        if char == quote:
+            if next_char == quote:
+                output.append(next_char)
+                index += 2
+                continue
+            if index == 0 or text[index - 1] != "\\":
+                state = "normal"
+        index += 1
+    return re.sub(r"\s+", " ", "".join(output)).strip()
+
+
+def extract_sql_draft_entries(
+    text: str,
+    errors: list[str],
+) -> list[dict[str, object]]:
+    markers = list(SQL_DRAFT_MARKER_PATTERN.finditer(text))
+    entries: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    for index, marker in enumerate(markers):
+        try:
+            metadata = json.loads(marker.group(1))
+        except json.JSONDecodeError as exc:
+            errors.append(f"sql-draft.sql GGG_SQL JSON 无法解析: {exc.msg}")
+            continue
+        if not isinstance(metadata, dict):
+            errors.append("sql-draft.sql GGG_SQL 必须是 JSON 对象")
+            continue
+        sql_id = str(metadata.get("id", "")).strip()
+        sql_type = str(metadata.get("type", "")).strip().upper()
+        objects = metadata.get("objects")
+        claims = metadata.get("claims")
+        if not re.fullmatch(r"SQL\d+", sql_id):
+            errors.append(f"sql-draft.sql GGG_SQL id 非法或缺失: {sql_id or '空'}")
+        elif sql_id in seen_ids:
+            errors.append(f"sql-draft.sql SQL ID 重复: {sql_id}")
+        else:
+            seen_ids.add(sql_id)
+        if sql_type not in SQL_DRAFT_TYPES:
+            errors.append(f"sql-draft.sql {sql_id or '未知 SQL'} type 非法: {sql_type or '空'}")
+        for label, values, pattern in [
+            ("objects", objects, r"[A-Za-z_`][A-Za-z0-9_.$`-]*"),
+            ("claims", claims, r"C\d+"),
+        ]:
+            if not isinstance(values, list) or not values:
+                errors.append(f"sql-draft.sql {sql_id or '未知 SQL'} {label} 必须是非空数组")
+                continue
+            normalized_values = [str(value).strip() for value in values]
+            if any(not re.fullmatch(pattern, value) for value in normalized_values):
+                errors.append(
+                    f"sql-draft.sql {sql_id or '未知 SQL'} {label} 包含非法值"
+                )
+            if len(set(normalized_values)) != len(normalized_values):
+                errors.append(
+                    f"sql-draft.sql {sql_id or '未知 SQL'} {label} 包含重复值"
+                )
+        statement_end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+        statement = text[marker.end():statement_end].strip()
+        normalized_statement = normalize_sql_semantics(statement)
+        expected_pattern = {
+            "SELECT": r"^select\b",
+            "INSERT": r"^insert\b",
+            "UPDATE": r"^update\b",
+            "DELETE": r"^delete\b",
+            "DDL": r"^(?:create|alter|drop|truncate|rename)\b",
+        }.get(sql_type, r"$^")
+        if not normalized_statement or not re.search(expected_pattern, normalized_statement):
+            errors.append(
+                f"sql-draft.sql {sql_id or '未知 SQL'} 后缺少与 type={sql_type or '空'} 匹配的 SQL"
+            )
+        if normalized_statement and not normalized_statement.rstrip().endswith(";"):
+            errors.append(f"sql-draft.sql {sql_id or '未知 SQL'} 语句缺少结束分号")
+        entries.append(
+            {
+                "id": sql_id,
+                "type": sql_type,
+                "objects": tuple(str(value).strip() for value in objects)
+                if isinstance(objects, list)
+                else tuple(),
+                "claims": tuple(str(value).strip() for value in claims)
+                if isinstance(claims, list)
+                else tuple(),
+                "statement": normalized_statement,
+            }
+        )
+    return entries
+
+
+def sql_draft_semantic_fingerprint(text: str) -> str:
+    errors: list[str] = []
+    entries = extract_sql_draft_entries(text, errors)
+    if errors:
+        return ""
+    payload = json.dumps(entries, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256((payload + "\n").encode("utf-8")).hexdigest()
+
+
+def research_sql_gate_snapshot(
+    text: str,
+    errors: list[str],
+    valid_claim_ids: set[str] | None = None,
+) -> dict[str, object]:
+    section = research_sql_section(text)
+    if not section:
+        errors.append("01-research.md 缺少 SQL 影响与确认准备")
+        return {
+            "impact_type": "",
+            "draft": "",
+            "status": "",
+            "source": "",
+            "semantic_fingerprint": "",
+            "rows": {},
+        }
+    display_impact = extract_line_value(section, "- SQL 影响类型：").strip()
+    impact_type = SQL_IMPACT_TYPES.get(display_impact, "")
+    if not impact_type:
+        errors.append(
+            "01-research.md SQL 影响类型必须为“不涉及 / 查询或DML / DDL”之一"
+        )
+    draft = extract_line_value(section, "- SQL 草案：").strip().strip("`")
+    status = extract_line_value(section, "- SQL 确认状态：").strip()
+    source = extract_line_value(section, "- SQL 确认来源：").strip()
+    semantic_fingerprint = extract_line_value(section, "- SQL 语义指纹：").strip()
+    if status not in {"待确认", "已确认"}:
+        errors.append("01-research.md SQL 确认状态必须为“待确认”或“已确认”")
+
+    required_headers = [
+        "SQL ID",
+        "类型",
+        "表/对象",
+        "JOIN/关联",
+        "过滤/权限条件",
+        "排序/分页",
+        "写入字段",
+        "更新条件/影响行数",
+        "并发/兼容边界",
+        "来源Cxx",
+        "证据ID",
+    ]
+    headers, rows = find_table(section, required_headers)
+    if not headers:
+        errors.append("01-research.md SQL 影响表缺少固定表头")
+        return {
+            "impact_type": impact_type,
+            "draft": draft,
+            "status": status,
+            "source": source,
+            "semantic_fingerprint": semantic_fingerprint,
+            "rows": {},
+        }
+    actual_rows: dict[str, dict[str, str]] = {}
+    for row in actual_table_rows(headers, rows, "SQL ID"):
+        sql_id = table_cell(headers, row, "SQL ID")
+        sql_type = table_cell(headers, row, "类型").upper()
+        if not re.fullmatch(r"SQL\d+", sql_id or ""):
+            errors.append(f"01-research.md SQL 影响表包含非法 SQL ID: {sql_id or '空'}")
+            continue
+        if sql_id in actual_rows:
+            errors.append(f"01-research.md SQL ID 重复: {sql_id}")
+            continue
+        if sql_type not in SQL_DRAFT_TYPES | {"不涉及"}:
+            errors.append(f"01-research.md {sql_id} 类型非法: {sql_type or '空'}")
+        claims = claim_refs(table_cell(headers, row, "来源Cxx"))
+        evidence = evidence_refs(table_cell(headers, row, "证据ID"))
+        if not claims:
+            errors.append(f"01-research.md {sql_id} 缺少 Cxx 来源")
+        if not evidence:
+            errors.append(f"01-research.md {sql_id} 缺少 Exx 证据")
+        assert_claim_refs_exist(
+            f"01-research.md {sql_id}",
+            claims,
+            valid_claim_ids,
+            errors,
+        )
+        object_value = table_cell(headers, row, "表/对象")
+        if not meaningful_design_value(object_value):
+            errors.append(f"01-research.md {sql_id} 缺少表或对象")
+        actual_rows[sql_id] = {
+            header: table_cell(headers, row, header)
+            for header in required_headers
+        }
+
+    if impact_type == "none":
+        if len(actual_rows) != 1 or any(
+            row["类型"] != "不涉及" for row in actual_rows.values()
+        ):
+            errors.append("01-research.md SQL 不涉及时必须且只能保留一条“不涉及”SQL 行")
+        if not draft.startswith("不涉及：") or len(draft) <= len("不涉及："):
+            errors.append("01-research.md SQL 不涉及时必须在 SQL 草案写“不涉及：具体原因”")
+    elif impact_type in {"query_dml", "ddl"}:
+        if draft != "sql-draft.sql":
+            errors.append("01-research.md 涉及 SQL 时 SQL 草案必须填写 `sql-draft.sql`")
+        if not actual_rows:
+            errors.append("01-research.md 涉及 SQL 时 SQL 影响表必须包含真实 SQL 行")
+        if any(row["类型"] == "不涉及" for row in actual_rows.values()):
+            errors.append("01-research.md 涉及 SQL 时不能保留“不涉及”SQL 行")
+        if impact_type == "query_dml" and any(
+            row["类型"] == "DDL" for row in actual_rows.values()
+        ):
+            errors.append("01-research.md 查询或DML 类型不能包含 DDL 行")
+        if impact_type == "ddl" and not any(
+            row["类型"] == "DDL" for row in actual_rows.values()
+        ):
+            errors.append("01-research.md DDL 类型至少需要一条 DDL 行")
+
+    if status == "已确认":
+        if not meaningful_design_value(source):
+            errors.append("01-research.md SQL 已确认但缺少确认来源")
+        if not re.fullmatch(r"[0-9a-f]{64}", semantic_fingerprint):
+            errors.append("01-research.md SQL 已确认但缺少合法 64 位语义指纹")
+    return {
+        "impact_type": impact_type,
+        "draft": draft,
+        "status": status,
+        "source": source,
+        "semantic_fingerprint": semantic_fingerprint,
+        "rows": actual_rows,
+    }
+
+
+def validate_sql_draft_doc(
+    path: Path,
+    valid_claim_ids: set[str] | None = None,
+    expected_rows: dict[str, dict[str, str]] | None = None,
+    expected_impact_type: str | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    text = read_text(path)
+    if not text:
+        return [f"缺少 {path.name}"]
+    if sql_draft_version(text) != 1:
+        errors.append("sql-draft.sql 缺少或使用不支持的 GGG_SQL_DRAFT_VERSION")
+    assert_no_unresolved_placeholders(text, path.name, errors)
+    entries = extract_sql_draft_entries(text, errors)
+    if not entries:
+        errors.append("sql-draft.sql 未登记任何 GGG_SQL 语句")
+    entry_map = {str(entry["id"]): entry for entry in entries if entry["id"]}
+    expected_rows = expected_rows or {}
+    if expected_rows:
+        for missing in sorted(set(expected_rows) - set(entry_map)):
+            errors.append(f"sql-draft.sql 缺少 01-research.md 中的 SQL: {missing}")
+        for extra in sorted(set(entry_map) - set(expected_rows)):
+            errors.append(f"sql-draft.sql 包含 01-research.md 未登记的 SQL: {extra}")
+    for sql_id, entry in entry_map.items():
+        claims = set(entry["claims"])
+        assert_claim_refs_exist(f"sql-draft.sql {sql_id}", claims, valid_claim_ids, errors)
+        expected = expected_rows.get(sql_id)
+        if expected and entry["type"] != expected["类型"].upper():
+            errors.append(
+                f"sql-draft.sql {sql_id} 类型与 01-research.md 不一致:"
+                f" draft={entry['type']} research={expected['类型']}"
+            )
+    if expected_impact_type == "query_dml" and any(
+        entry["type"] == "DDL" for entry in entries
+    ):
+        errors.append("sql-draft.sql 查询或DML Gate 不能包含 DDL")
+    if expected_impact_type == "ddl" and not any(
+        entry["type"] == "DDL" for entry in entries
+    ):
+        errors.append("sql-draft.sql DDL Gate 至少需要一条 DDL")
+    return errors
+
+
+def validate_sql_gate_binding(
+    feature_dir: Path,
+    meta: dict,
+    research_text: str,
+    valid_claim_ids: set[str] | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    snapshot = research_sql_gate_snapshot(research_text, errors, valid_claim_ids)
+    gates = meta.get("gates", {})
+    confirmation = meta.get("sql_confirmation", {})
+    if not gates.get("sql_confirmed"):
+        errors.append("SQL Gate 尚未完成用户确认，不能进入技术方案")
+        return errors
+    if snapshot["status"] != "已确认":
+        errors.append("meta.json 已标记 SQL 确认，但 01-research.md SQL 确认状态不是已确认")
+    impact_type = str(snapshot["impact_type"])
+    if confirmation.get("impact_type") != impact_type:
+        errors.append("meta.json SQL impact_type 与 01-research.md 不一致")
+    current_research_fingerprint = research_sql_semantic_fingerprint(research_text)
+    confirmed_research_fingerprint = str(
+        confirmation.get("research_semantic_fingerprint", "")
+    )
+    if confirmed_research_fingerprint != current_research_fingerprint:
+        errors.append("01-research.md SQL 语义在用户确认后发生变化，必须重新执行 confirm-sql")
+    if confirmation.get("confirmation_source") != snapshot["source"]:
+        errors.append("meta.json SQL 确认来源与 01-research.md 不一致")
+
+    draft_path = feature_dir / "sql-draft.sql"
+    if impact_type == "none":
+        if draft_path.exists():
+            errors.append("SQL Gate 为 none 时不应创建 sql-draft.sql")
+        current_draft_fingerprint = ""
+    else:
+        errors.extend(
+            validate_sql_draft_doc(
+                draft_path,
+                valid_claim_ids,
+                snapshot["rows"],  # type: ignore[arg-type]
+                impact_type,
+            )
+        )
+        current_draft_fingerprint = sql_draft_semantic_fingerprint(read_text(draft_path))
+        if not current_draft_fingerprint:
+            errors.append("sql-draft.sql 无法生成有效语义指纹")
+    if str(confirmation.get("draft_semantic_fingerprint", "")) != current_draft_fingerprint:
+        errors.append("sql-draft.sql 语义在用户确认后发生变化，必须重新执行 confirm-sql")
+    combined = hashlib.sha256(
+        f"{impact_type}\n{current_research_fingerprint}\n{current_draft_fingerprint}\n".encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if snapshot["semantic_fingerprint"] != combined:
+        errors.append("01-research.md SQL 语义指纹与当前 SQL Gate 不一致")
+    if confirmation.get("semantic_fingerprint") != combined:
+        errors.append("meta.json SQL 语义指纹与当前 SQL Gate 不一致")
+    return errors
+
+
+def validate_design_sql_gate_binding(
+    design_text: str,
+    research_text: str,
+    meta: dict,
+) -> list[str]:
+    """确保 Design v6 只引用当前已锁定的 SQL Gate，而不是重新设计 SQL。"""
+    errors: list[str] = []
+    confirmation = meta.get("sql_confirmation", {})
+    expected_impact = str(confirmation.get("impact_type", ""))
+    actual_impact = SQL_IMPACT_TYPES.get(
+        extract_line_value(design_text, "- SQL 影响类型：").strip(),
+        "",
+    )
+    if actual_impact != expected_impact:
+        errors.append("02-design.md SQL 影响类型与已确认 SQL Gate 不一致")
+    if (
+        extract_line_value(design_text, "- SQL 确认来源：").strip()
+        != str(confirmation.get("confirmation_source", ""))
+    ):
+        errors.append("02-design.md SQL 确认来源与已确认 SQL Gate 不一致")
+    if (
+        extract_line_value(design_text, "- SQL 语义指纹：").strip()
+        != str(confirmation.get("semantic_fingerprint", ""))
+    ):
+        errors.append("02-design.md SQL 语义指纹与已确认 SQL Gate 不一致")
+
+    if expected_impact == "none":
+        return errors
+    snapshot_errors: list[str] = []
+    snapshot = research_sql_gate_snapshot(research_text, snapshot_errors)
+    errors.extend(snapshot_errors)
+    expected_rows = snapshot["rows"]
+    if not isinstance(expected_rows, dict):
+        return errors
+    section = extract_section(design_text, "## 五、已确认 SQL 引用")
+    headers, rows = find_table(
+        section,
+        ["SQL ID/对象", "SQL 类型"],
+    )
+    design_rows: dict[str, str] = {}
+    for row in actual_table_rows(headers, rows, "SQL ID/对象"):
+        key = table_cell(headers, row, "SQL ID/对象")
+        if key.startswith("不涉及："):
+            continue
+        sql_ids = re.findall(r"\bSQL\d+\b", key)
+        for sql_id in sql_ids:
+            design_rows[sql_id] = table_cell(headers, row, "SQL 类型").upper()
+    if set(design_rows) != set(expected_rows):
+        errors.append(
+            "02-design.md 已确认 SQL 引用与 01-research.md 不一致:"
+            f" design={sorted(design_rows)} research={sorted(expected_rows)}"
+        )
+    for sql_id in sorted(set(design_rows) & set(expected_rows)):
+        expected_type = str(expected_rows[sql_id].get("类型", "")).upper()
+        if design_rows[sql_id] != expected_type:
+            errors.append(
+                f"02-design.md {sql_id} 类型与 01-research.md 不一致:"
+                f" design={design_rows[sql_id]} research={expected_type}"
+            )
+    return errors
 
 
 DDL_MARKER_PATTERN = re.compile(
@@ -1214,8 +1720,30 @@ def assert_baseline_quality(
         errors,
     )
 
-    if document_schema_version(text) >= 4:
+    baseline_version = document_schema_version(text)
+    if baseline_version >= 4:
         assert_strict_baseline_ids(text, errors)
+    if baseline_version >= 5:
+        recommended_mode = extract_line_value(text, "- 推荐模式：").strip()
+        recommendation_reason = extract_line_value(text, "- 推荐依据：").strip()
+        selected_mode = extract_line_value(text, "- 最终模式：").strip()
+        selection_source = extract_line_value(text, "- 模式选择来源：").strip()
+        if recommended_mode not in {"quick", "full"}:
+            errors.append("00-baseline.md 推荐模式必须为 quick 或 full")
+        if selected_mode != "full":
+            errors.append("00-baseline.md full 基线的最终模式必须为 full")
+        for value, label in [
+            (recommendation_reason, "推荐依据"),
+            (selection_source, "模式选择来源"),
+        ]:
+            if (
+                not meaningful_design_value(value)
+                or vague_design_value(value)
+                or "{{" in value
+                or value in {"用户消息", "用户选择", "AI决定", "已授权"}
+                or any(token in value for token in ["待确认", "TODO", "TBD", "按需", "视情况"])
+            ):
+                errors.append(f"00-baseline.md {label}缺少可回查的实质内容")
 
     # 单文件校验默认根据文档字段识别新版门禁；目录校验以 meta.json 为权威开关。
     gate_enabled = clarification_gate_required if clarification_gate_required is not None else "- 基线状态：" in text
@@ -1747,7 +2275,9 @@ def assert_research_quality(
     strict: bool = False,
 ) -> None:
     current_format = "## 8. 结论账本（Claim Ledger）" in text
-    research_v2 = research_schema_version(text) >= 2
+    research_version = research_schema_version(text)
+    research_v2 = research_version >= 2
+    research_v3 = research_version >= 3
     if current_format:
         for heading in [
             "## 1. Baseline 验证清单",
@@ -1770,6 +2300,11 @@ def assert_research_quality(
             count = len(re.findall(rf"(?m)^{re.escape(shared_heading)}\s*$", text))
             if count != 1:
                 errors.append(f"01-research.md 章节“{shared_heading}”必须且只能出现一次，当前 {count} 次")
+        if research_v3:
+            sql_heading = "### 7.1 SQL 影响与确认准备"
+            count = len(re.findall(rf"(?m)^{re.escape(sql_heading)}\s*$", text))
+            if count != 1:
+                errors.append(f"01-research.md 章节“{sql_heading}”必须且只能出现一次，当前 {count} 次")
     baseline_check = extract_section(text, "## 1. Baseline 验证清单")
     main_flow = extract_section(text, "## 2. 主链路代码事实")
     old_side_effects = extract_section(text, "## 3. 旧链路副作用清单")
@@ -1783,6 +2318,12 @@ def assert_research_quality(
             maxsplit=1,
         )[0].rstrip()
     cross_project = extract_section(text, "## 7. 跨项目依赖能力")
+    sql_gate = research_sql_section(text)
+    if sql_gate:
+        cross_project = cross_project.split(
+            "### 7.1 SQL 影响与确认准备",
+            maxsplit=1,
+        )[0].rstrip()
     coverage = extract_section(text, "## 8. 代码证据覆盖度、运行时证据缺口和置信度") if not current_format else ""
     claim_ledger = extract_section(
         text,
@@ -1827,6 +2368,14 @@ def assert_research_quality(
             "01-research.md",
             errors,
             min_lines=2,
+        )
+    if research_v3:
+        assert_section_has_substance(
+            sql_gate,
+            "### 7.1 SQL 影响与确认准备",
+            "01-research.md",
+            errors,
+            min_lines=3,
         )
     if not current_format:
         assert_section_has_substance(coverage, "## 8. 代码证据覆盖度、运行时证据缺口和置信度", "01-research.md", errors, min_lines=2)
@@ -1906,6 +2455,8 @@ def assert_research_quality(
             assert_research_detail_claim_refs(section, label, key_header, valid_claim_ids, errors)
         if research_v2:
             assert_shared_semantic_impact(shared_semantic, claim_ledger, blocking, evidence, errors)
+        if research_v3:
+            research_sql_gate_snapshot(text, errors, valid_claim_ids)
     # 新版唯一疑问账本显式区分用户意图、代码事实和设计选择；旧文档保持兼容。
     if current_format or "问题类型" in blocking:
         question_headers = ["编号", "疑问", "问题类型", "准确来源", "应由谁确认", "确认结论/转交说明", "状态"]
@@ -3076,6 +3627,258 @@ def assert_design_quality_v4(
     assert_design_decision_quality(text, decisions, errors, eligible_claim_ids)
 
 
+def assert_design_sql_reference_v6(
+    text: str,
+    errors: list[str],
+    eligible_claim_ids: set[str] | None,
+) -> None:
+    impact_display = extract_line_value(text, "- SQL 影响类型：").strip()
+    impact_type = SQL_IMPACT_TYPES.get(impact_display, "")
+    if not impact_type:
+        errors.append("02-design.md SQL 影响类型必须为“不涉及 / 查询或DML / DDL”之一")
+    source = extract_line_value(text, "- SQL 确认来源：").strip()
+    fingerprint = extract_line_value(text, "- SQL 语义指纹：").strip()
+    if not meaningful_design_value(source):
+        errors.append("02-design.md 缺少已确认 SQL 的用户确认来源")
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        errors.append("02-design.md 缺少合法的 64 位 SQL 语义指纹")
+
+    section = extract_section(text, "## 五、已确认 SQL 引用")
+    gate_value = extract_line_value(section, "- SQL Gate：").strip()
+    required = [
+        "设计ID",
+        "SQL ID/对象",
+        "SQL 类型",
+        "业务理由",
+        "代码落点",
+        "事务/并发边界",
+        "兼容/回滚/验证",
+        "来源Cxx",
+    ]
+    headers, rows = find_table(section, required)
+    if not headers:
+        errors.append("02-design.md 已确认 SQL 引用表缺少固定表头")
+        return
+    actual = actual_table_rows(headers, rows, "SQL ID/对象")
+    if impact_type == "none":
+        if not gate_value.startswith("不涉及：") or len(gate_value) <= len("不涉及："):
+            errors.append("02-design.md SQL 不涉及时必须写“SQL Gate：不涉及：具体原因（Cxx）”")
+        refs = claim_refs(gate_value)
+        if not refs:
+            errors.append("02-design.md SQL 不涉及原因必须引用 Cxx")
+        assert_claim_refs_exist("02-design.md SQL Gate", refs, eligible_claim_ids, errors)
+        if any(
+            not table_cell(headers, row, "SQL ID/对象").startswith("不涉及：")
+            for row in actual
+        ):
+            errors.append("02-design.md SQL 不涉及时不能登记真实 SQL 引用")
+        return
+
+    if gate_value != "已确认 `sql-draft.sql`" and gate_value != "已确认 sql-draft.sql":
+        errors.append("02-design.md 涉及 SQL 时必须声明“SQL Gate：已确认 `sql-draft.sql`”")
+    real_rows = [
+        row
+        for row in actual
+        if not table_cell(headers, row, "SQL ID/对象").startswith("不涉及：")
+    ]
+    if not real_rows:
+        errors.append("02-design.md 涉及 SQL 时必须登记至少一条已确认 SQL 引用")
+    seen_sql_ids: set[str] = set()
+    for row in real_rows:
+        key = table_cell(headers, row, "SQL ID/对象")
+        sql_ids = set(re.findall(r"\bSQL\d+\b", key))
+        if not sql_ids:
+            errors.append(f"02-design.md SQL 引用“{key}”缺少 SQL ID")
+        for sql_id in sql_ids:
+            if sql_id in seen_sql_ids:
+                errors.append(f"02-design.md SQL ID 重复引用: {sql_id}")
+            seen_sql_ids.add(sql_id)
+        d_ids = design_refs(table_cell(headers, row, "设计ID"))
+        if len(d_ids) != 1:
+            errors.append(f"02-design.md SQL 引用“{key}”必须且只能绑定一个 Dxx")
+        refs = claim_refs(table_cell(headers, row, "来源Cxx"))
+        if not refs:
+            errors.append(f"02-design.md SQL 引用“{key}”缺少 Cxx 来源")
+        assert_claim_refs_exist(f"02-design.md SQL 引用“{key}”", refs, eligible_claim_ids, errors)
+        sql_type = table_cell(headers, row, "SQL 类型").upper()
+        if sql_type not in SQL_DRAFT_TYPES:
+            errors.append(f"02-design.md SQL 引用“{key}”类型非法: {sql_type or '空'}")
+        for header in required[3:-1]:
+            if not meaningful_design_value(table_cell(headers, row, header)):
+                errors.append(f"02-design.md SQL 引用“{key}”缺少实质字段: {header}")
+    if impact_type == "query_dml" and any(
+        table_cell(headers, row, "SQL 类型").upper() == "DDL" for row in real_rows
+    ):
+        errors.append("02-design.md 查询或DML Gate 不能引用 DDL")
+    if impact_type == "ddl" and not any(
+        table_cell(headers, row, "SQL 类型").upper() == "DDL" for row in real_rows
+    ):
+        errors.append("02-design.md DDL Gate 至少需要引用一条 DDL")
+
+
+def assert_design_interface_index_v6(text: str, errors: list[str]) -> None:
+    section = extract_section(text, "## 八、接口设计")
+    required = [
+        "接口名称",
+        "新增/修改",
+        "请求方式",
+        "路径/方法",
+        "所属项目",
+        "接口文档地址",
+        "备注",
+    ]
+    headers, rows = find_table(section, required)
+    if not headers:
+        errors.append("02-design.md 接口设计缺少固定七列表头")
+        return
+    actual = actual_table_rows(headers, rows, "接口名称")
+    no_interface_rows = [
+        row
+        for row in actual
+        if table_cell(headers, row, "接口名称").startswith("不涉及：")
+    ]
+    real_rows = [row for row in actual if row not in no_interface_rows]
+    if no_interface_rows and real_rows:
+        errors.append("02-design.md 接口设计不能同时声明不涉及和登记真实接口")
+    if len(no_interface_rows) > 1:
+        errors.append("02-design.md 接口设计声明不涉及只能保留一行")
+
+    index_identifiers: set[str] = set()
+    detail_refs: set[str] = set()
+    for row in real_rows:
+        name = table_cell(headers, row, "接口名称")
+        change = table_cell(headers, row, "新增/修改")
+        method = table_cell(headers, row, "请求方式")
+        path_or_method = table_cell(headers, row, "路径/方法")
+        if change not in {"新增", "修改"}:
+            errors.append(f"02-design.md 接口“{name}”新增/修改必须为新增或修改")
+        for header in ["请求方式", "路径/方法", "所属项目", "接口文档地址", "备注"]:
+            if not meaningful_design_value(table_cell(headers, row, header)):
+                errors.append(f"02-design.md 接口“{name}”缺少实质字段: {header}")
+        identifier = normalize_contract_identifier(
+            f"{method} {path_or_method}"
+            if method.upper() in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+            else path_or_method
+        )
+        if identifier in index_identifiers:
+            errors.append(f"02-design.md 接口设计重复登记路径/方法: {identifier}")
+        index_identifiers.add(identifier)
+        detail = table_cell(headers, row, "接口文档地址").strip().strip("`").replace("\\", "/")
+        if detail.startswith("无需：") and len(detail) > len("无需："):
+            continue
+        if not re.fullmatch(r"interface-details/02-interface-\d{2}-.+\.md", detail):
+            errors.append(f"02-design.md 接口“{name}”的接口文档地址非法: {detail}")
+        else:
+            detail_refs.add(detail.split("/")[-1])
+
+    contract_section = extract_section(text, "## 三、调用方与接口契约")
+    contract_headers, contract_rows = find_table(
+        contract_section,
+        [
+            "设计ID",
+            "调用方/触发事件",
+            "契约类型",
+            "契约标识",
+            "输入关键字段",
+            "后端推导字段/来源",
+            "禁止外部传字段",
+            "输出字段",
+            "副作用",
+            "独立明细",
+            "来源Cxx",
+            "说明",
+        ],
+    )
+    contract_identifiers = {
+        normalize_contract_identifier(table_cell(contract_headers, row, "契约标识"))
+        for row in actual_table_rows(contract_headers, contract_rows, "调用方/触发事件")
+        if not table_cell(contract_headers, row, "调用方/触发事件").startswith("不涉及：")
+    }
+    if no_interface_rows and contract_identifiers:
+        errors.append("02-design.md 接口设计声明不涉及，但调用方与接口契约仍有真实契约")
+    for missing in sorted(contract_identifiers - index_identifiers):
+        errors.append(f"02-design.md 接口设计遗漏契约: {missing}")
+    for extra in sorted(index_identifiers - contract_identifiers):
+        errors.append(f"02-design.md 接口设计包含未在契约主表登记的接口: {extra}")
+
+    # 文件存在性和孤立文档由统一接口闭环校验负责；此处只核对两个主表的地址一致性。
+    contract_detail_refs = {
+        table_cell(contract_headers, row, "独立明细").strip().strip("`").replace("\\", "/").split("/")[-1]
+        for row in actual_table_rows(contract_headers, contract_rows, "调用方/触发事件")
+        if re.fullmatch(
+            r"interface-details/02-interface-\d{2}-.+\.md",
+            table_cell(contract_headers, row, "独立明细").strip().strip("`").replace("\\", "/"),
+        )
+    }
+    if detail_refs != contract_detail_refs:
+        errors.append(
+            "02-design.md 接口设计的接口文档地址与调用方契约表不一致:"
+            f" 接口设计={sorted(detail_refs)}，契约主表={sorted(contract_detail_refs)}"
+        )
+
+
+def assert_design_quality_v6(
+    text: str,
+    errors: list[str],
+    valid_claim_ids: set[str] | None,
+    eligible_claim_ids: set[str] | None,
+    transferred_question_ids: set[str] | None,
+) -> None:
+    input_coverage = extract_section(text, "## 〇、设计输入去向")
+    instance_identity = extract_section(text, "## 二、实例身份与可信边界")
+    contract_flow = extract_section(text, "## 三、调用方与接口契约")
+    data_carrier = extract_section(text, "## 四、数据承载设计")
+    sql_reference = extract_section(text, "## 五、已确认 SQL 引用")
+    core_changes = extract_section(text, "## 六、核心改动")
+    call_chain = extract_section(text, "## 七、主链路与依赖")
+    interface_index = extract_section(text, "## 八、接口设计")
+    decisions = extract_section(text, "## 十三、设计决策记录")
+    test_risk = extract_section(text, "## 十六、测试链路与风险")
+    if extract_line_value(text, "- 设计状态：") != "已完成":
+        errors.append("02-design.md 完整方案校验要求设计状态为“已完成”")
+    for section, heading, min_lines in [
+        (input_coverage, "## 〇、设计输入去向", 2),
+        (instance_identity, "## 二、实例身份与可信边界", 2),
+        (contract_flow, "## 三、调用方与接口契约", 2),
+        (data_carrier, "## 四、数据承载设计", 2),
+        (sql_reference, "## 五、已确认 SQL 引用", 2),
+        (core_changes, "## 六、核心改动", 2),
+        (call_chain, "## 七、主链路与依赖", 2),
+        (interface_index, "## 八、接口设计", 2),
+        (decisions, "## 十三、设计决策记录", 1),
+        (test_risk, "## 十六、测试链路与风险", 2),
+    ]:
+        assert_section_has_substance(section, heading, "02-design.md", errors, min_lines=min_lines)
+    assert_design_input_coverage(text, errors, eligible_claim_ids, transferred_question_ids)
+    assert_design_precheck_tables_v4(text, errors, eligible_claim_ids)
+    assert_design_sequence_choice_v4(text, errors)
+    for prefix in [
+        "- 异常与失败边界：",
+        "- 业务日志：",
+        "- Trace 链路：",
+    ]:
+        value = extract_line_value(call_chain, prefix).strip()
+        if (
+            not meaningful_design_value(value)
+            or value == "不涉及"
+            or re.fullmatch(r"不涉及[：:]具体原因(?:\s*/.*)?", value)
+        ):
+            errors.append(
+                f"02-design.md 主链路缺少实质设计: {prefix.rstrip('：')}"
+            )
+    assert_design_sql_reference_v6(text, errors, eligible_claim_ids)
+    assert_design_interface_index_v6(text, errors)
+    assert_design_traceability_v4(
+        text,
+        core_changes,
+        decisions,
+        errors,
+        valid_claim_ids,
+    )
+    assert_design_decision_closure(text, decisions, errors)
+    assert_design_decision_quality(text, decisions, errors, eligible_claim_ids)
+
+
 def assert_design_quality(
     text: str,
     errors: list[str],
@@ -3083,6 +3886,15 @@ def assert_design_quality(
     eligible_claim_ids: set[str] | None = None,
     transferred_question_ids: set[str] | None = None,
 ) -> None:
+    if design_schema_version(text) >= 6:
+        assert_design_quality_v6(
+            text,
+            errors,
+            valid_claim_ids,
+            eligible_claim_ids,
+            transferred_question_ids,
+        )
+        return
     if design_schema_version(text) >= 4:
         assert_design_quality_v4(
             text,
@@ -3141,6 +3953,25 @@ def interface_basic_info(text: str) -> dict[str, str]:
         for row in rows
         if table_cell(headers, row, "项")
     }
+
+
+def normalized_interface_info(text: str) -> dict[str, str]:
+    """将 Interface v4 的统一接口索引字段映射为既有契约闭包字段。"""
+    info = interface_basic_info(text)
+    if interface_schema_version(text) < 4:
+        return info
+    method = info.get("请求方式", "").strip()
+    path_or_method = info.get("路径/方法", "").strip()
+    identifier = (
+        f"{method} {path_or_method}"
+        if method.upper() in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+        else path_or_method
+    )
+    normalized = dict(info)
+    normalized["契约名称"] = info.get("接口名称", "")
+    normalized["新增 / 修改"] = info.get("新增/修改", "")
+    normalized["契约标识"] = normalize_contract_identifier(identifier)
+    return normalized
 
 
 def assert_json_example(
@@ -3204,9 +4035,12 @@ def assert_interface_detail_quality(path: Path, text: str, errors: list[str]) ->
     label = path.name
     if not INTERFACE_DETAIL_FILENAME.fullmatch(path.name):
         errors.append(f"{label} 命名不规范，推荐使用 02-interface-01-主题.md")
+    version = interface_schema_version(text)
     required_tokens = (
-        INTERFACE_DETAIL_V3_REQUIRED_TOKENS
-        if interface_schema_version(text) >= 3
+        INTERFACE_DETAIL_V4_REQUIRED_TOKENS
+        if version >= 4
+        else INTERFACE_DETAIL_V3_REQUIRED_TOKENS
+        if version >= 3
         else INTERFACE_DETAIL_REQUIRED_TOKENS
     )
     assert_contains(text, required_tokens, label, errors)
@@ -3282,13 +4116,25 @@ def interface_v3_contract_snapshot(
     label: str,
     errors: list[str],
 ) -> dict[str, object]:
-    info = interface_basic_info(text)
+    version = interface_schema_version(text)
+    info = normalized_interface_info(text)
     contract = extract_section(text, "## 2. 契约与参数")
     request = extract_section(contract, "### 2.1 请求参数表")
     response = extract_section(contract, "### 2.2 响应参数表")
+    request_required_headers = (
+        [
+            "字段", "位置", "Java 类型", "JSON 类型", "必填", "可空/空值语义",
+            "示例值", "来源", "是否后端推导", "外部是否允许传", "说明",
+        ]
+        if version >= 4
+        else [
+            "字段", "位置", "类型", "必填", "示例值", "来源",
+            "是否后端推导", "外部是否允许传", "说明",
+        ]
+    )
     request_headers, request_rows = find_table(
         request,
-        ["字段", "位置", "类型", "必填", "示例值", "来源", "是否后端推导", "外部是否允许传", "说明"],
+        request_required_headers,
     )
     actual_request = actual_table_rows(request_headers, request_rows, "字段")
     trusted: dict[str, str] = {}
@@ -3305,6 +4151,13 @@ def interface_v3_contract_snapshot(
         derived = table_cell(request_headers, row, "是否后端推导")
         external = table_cell(request_headers, row, "外部是否允许传")
         source = table_cell(request_headers, row, "来源")
+        if version >= 4:
+            required = table_cell(request_headers, row, "必填")
+            if required not in {"是", "否"}:
+                errors.append(f"{label} 请求字段 {field} 的必填必须为是或否")
+            null_semantics = table_cell(request_headers, row, "可空/空值语义")
+            if null_semantics in {"可空", "不适用", "按需", "视情况"}:
+                errors.append(f"{label} 请求字段 {field} 的可空/空值语义必须写明具体含义")
         if derived not in {"是", "否"}:
             errors.append(f"{label} 请求字段 {field} 的是否后端推导必须为是或否")
         if external not in {"是", "否"}:
@@ -3327,7 +4180,12 @@ def interface_v3_contract_snapshot(
     if no_request and len(actual_request) > 1:
         errors.append(f"{label} 请求参数声明不涉及时不能同时登记真实字段")
 
-    response_headers, response_rows = find_table(response, ["字段", "类型", "说明"])
+    response_required_headers = (
+        ["字段", "Java 类型", "JSON 类型", "必返", "可空/空值语义", "说明"]
+        if version >= 4
+        else ["字段", "类型", "说明"]
+    )
+    response_headers, response_rows = find_table(response, response_required_headers)
     actual_response = actual_table_rows(response_headers, response_rows, "字段")
     no_response = any(
         table_cell(response_headers, row, "字段").startswith("不涉及：")
@@ -3336,6 +4194,16 @@ def interface_v3_contract_snapshot(
     )
     if no_response and len(actual_response) > 1:
         errors.append(f"{label} 响应参数声明不涉及时不能同时登记真实字段")
+    if version >= 4:
+        for row in actual_response:
+            field = table_cell(response_headers, row, "字段")
+            if field.startswith("不涉及："):
+                continue
+            if table_cell(response_headers, row, "必返") not in {"是", "否"}:
+                errors.append(f"{label} 响应字段 {field} 的必返必须为是或否")
+            null_semantics = table_cell(response_headers, row, "可空/空值语义")
+            if null_semantics in {"可空", "不适用", "按需", "视情况"}:
+                errors.append(f"{label} 响应字段 {field} 的可空/空值语义必须写明具体含义")
     output = {
         table_cell(response_headers, row, "字段")
         for row in actual_response
@@ -3361,11 +4229,19 @@ def interface_v3_contract_snapshot(
 
 def assert_interface_detail_quality_v3(path: Path, text: str, errors: list[str]) -> None:
     label = path.name
-    info = interface_basic_info(text)
-    required_info = [
-        "设计ID", "来源Cxx", "契约名称", "新增 / 修改", "所属项目",
-        "契约类型", "契约标识", "调用方 / 触发事件", "处理入口",
-    ]
+    info = normalized_interface_info(text)
+    required_info = (
+        [
+            "设计ID", "来源Cxx", "接口名称", "新增/修改", "请求方式",
+            "路径/方法", "所属项目", "接口文档地址", "备注",
+            "契约类型", "调用方 / 触发事件", "处理入口",
+        ]
+        if interface_schema_version(text) >= 4
+        else [
+            "设计ID", "来源Cxx", "契约名称", "新增 / 修改", "所属项目",
+            "契约类型", "契约标识", "调用方 / 触发事件", "处理入口",
+        ]
+    )
     for key in required_info:
         if not meaningful_design_value(info.get(key, "")):
             errors.append(f"{label} 基本信息缺少实质内容: {key}")
@@ -3373,6 +4249,13 @@ def assert_interface_detail_quality_v3(path: Path, text: str, errors: list[str])
         errors.append(f"{label} 基本信息的设计ID必须是单个 Dxx")
     if not claim_refs(info.get("来源Cxx", "")):
         errors.append(f"{label} 基本信息缺少 Cxx 来源")
+    if interface_schema_version(text) >= 4:
+        if info.get("新增/修改") not in {"新增", "修改"}:
+            errors.append(f"{label} 基本信息的新增/修改必须为新增或修改")
+        if info.get("接口文档地址", "").strip().strip("`") != (
+            f"interface-details/{path.name}"
+        ):
+            errors.append(f"{label} 基本信息的接口文档地址必须指向当前文档")
     contract_type = info.get("契约类型", "")
     identifier = normalize_contract_identifier(info.get("契约标识", ""))
     if contract_type not in CONTRACT_TYPES:
@@ -3386,11 +4269,24 @@ def assert_interface_detail_quality_v3(path: Path, text: str, errors: list[str])
     contract = extract_section(text, "## 2. 契约与参数")
     request = extract_section(contract, "### 2.1 请求参数表")
     response = extract_section(contract, "### 2.2 响应参数表")
-    request_headers = [
-        "字段", "位置", "类型", "必填", "示例值", "来源", "是否后端推导", "外部是否允许传", "说明",
-    ]
+    request_headers = (
+        [
+            "字段", "位置", "Java 类型", "JSON 类型", "必填", "可空/空值语义",
+            "示例值", "来源", "是否后端推导", "外部是否允许传", "说明",
+        ]
+        if interface_schema_version(text) >= 4
+        else [
+            "字段", "位置", "类型", "必填", "示例值", "来源",
+            "是否后端推导", "外部是否允许传", "说明",
+        ]
+    )
+    response_headers = (
+        ["字段", "Java 类型", "JSON 类型", "必返", "可空/空值语义", "说明"]
+        if interface_schema_version(text) >= 4
+        else ["字段", "类型", "说明"]
+    )
     assert_parameter_table(request, f"{label} 请求参数", request_headers, errors)
-    assert_parameter_table(response, f"{label} 响应参数", ["字段", "类型", "说明"], errors)
+    assert_parameter_table(response, f"{label} 响应参数", response_headers, errors)
     snapshot = interface_v3_contract_snapshot(text, label, errors)
 
     request_json = assert_json_example(
@@ -3429,7 +4325,13 @@ def assert_interface_detail_quality_v3(path: Path, text: str, errors: list[str])
         for field in sorted(response_paths - expected_response):  # type: ignore[operator]
             errors.append(f"{label} 响应 JSON 字段未在响应参数表中闭环: {field}")
 
-    for prefix in ["- 参数校验：", "- 关键业务规则：", "- 兼容旧契约：", "- 输出副作用："]:
+    closure_prefixes = ["- 参数校验："]
+    if interface_schema_version(text) >= 4:
+        closure_prefixes.append("- 数值精度与序列化：")
+    closure_prefixes.extend(
+        ["- 关键业务规则：", "- 兼容旧契约：", "- 输出副作用："]
+    )
+    for prefix in closure_prefixes:
         if not meaningful_design_value(extract_line_value(contract, prefix)):
             errors.append(f"{label} 缺少契约闭环说明: {prefix.rstrip('：')}")
 
@@ -3695,12 +4597,13 @@ def assert_interface_closure_v5(
                 )
 
 
-def source_refs(value: str) -> tuple[set[str], set[str], bool, bool]:
+def source_refs(value: str) -> tuple[set[str], set[str], bool, bool, bool]:
     return (
         design_refs(value),
         claim_refs(value),
         "interface-details/" in value or "interface-details\\" in value,
         "04-schema.sql" in value,
+        "sql-draft.sql" in value,
     )
 
 
@@ -3711,18 +4614,26 @@ def assert_source_value_traceability(
     valid_design_ids: set[str] | None = None,
     valid_claim_ids: set[str] | None = None,
     schema_exists: bool = False,
+    sql_draft_exists: bool = False,
 ) -> None:
     source = source.strip()
-    d_refs, c_refs, has_interface_ref, has_schema_ref = source_refs(source)
+    d_refs, c_refs, has_interface_ref, has_schema_ref, has_sql_draft_ref = source_refs(
+        source
+    )
     if not source or source in {"-", "无", "不涉及"}:
         errors.append(f"{label} 缺少来源依据")
         return
     if not d_refs:
-        errors.append(f"{label} 来源依据必须引用至少一个核心改动 Dxx；Cxx、interface-details 和 04-schema.sql 只能作为补充依据")
+        errors.append(
+            f"{label} 来源依据必须引用至少一个核心改动 Dxx；"
+            "Cxx、interface-details、sql-draft.sql 和 04-schema.sql 只能作为补充依据"
+        )
     assert_design_refs_exist(label, d_refs, valid_design_ids, errors)
     assert_claim_refs_exist(label, c_refs, valid_claim_ids, errors)
     if has_schema_ref and not schema_exists:
         errors.append(f"{label} 引用了 04-schema.sql，但当前需求目录未发现该文件")
+    if has_sql_draft_ref and not sql_draft_exists:
+        errors.append(f"{label} 引用了 sql-draft.sql，但当前需求目录未发现该文件")
 
 
 def assert_task_source_traceability(
@@ -3732,6 +4643,7 @@ def assert_task_source_traceability(
     valid_claim_ids: set[str] | None = None,
     schema_exists: bool = False,
     required_core_design_ids: set[str] | None = None,
+    sql_draft_exists: bool = False,
 ) -> set[str]:
     headers, rows = extract_first_table(overview)
     if "来源依据" not in headers:
@@ -3753,6 +4665,7 @@ def assert_task_source_traceability(
             valid_design_ids,
             valid_claim_ids,
             schema_exists,
+            sql_draft_exists,
         )
         if required_core_design_ids and not (task_design_ids & required_core_design_ids):
             errors.append(f"03-tasks.md {task_id} 未关联 02-design.md 核心改动中的 Dxx")
@@ -4099,6 +5012,25 @@ def task_necessary_test_has_substance(value: str) -> bool:
     return len(normalized) >= 4
 
 
+def task_v3_test_code_policy(value: str) -> tuple[str, str]:
+    """返回 v3 测试代码策略及错误原因；默认明确不新增测试代码。"""
+    normalized = normalized_task_completion_value(value)
+    if normalized == "默认不新增":
+        return "default_none", ""
+    match = re.match(r"^用户明确要求[：:](.+)$", value.strip(), re.DOTALL)
+    if not match:
+        return "", "必须填写“默认不新增”或“用户明确要求：具体内容＋授权来源”"
+    detail = match.group(1).strip()
+    normalized_detail = normalized_task_completion_value(detail)
+    if (
+        len(normalized_detail) < 10
+        or "具体测试类、测试桩、数据构造或用例场景＋授权来源" in detail
+        or not re.search(r"授权|用户消息|用户要求|用户确认", detail)
+    ):
+        return "", "用户明确要求测试代码时必须写清具体测试内容和可回查授权来源"
+    return "user_authorized", ""
+
+
 def task_code_result_has_substance(value: str) -> bool:
     normalized = normalized_task_completion_value(value)
     if len(normalized) < 6 or normalized in {
@@ -4266,12 +5198,29 @@ def assert_tasks_quality_v2(
     valid_claim_ids: set[str] | None = None,
     schema_exists: bool = False,
     required_core_design_ids: set[str] | None = None,
+    sql_draft_exists: bool = False,
 ) -> None:
+    version = task_schema_version(text)
     overview = extract_section(text, "## 3. 任务总览")
     detail = extract_section(text, "## 4. 任务详情")
     done = extract_section(text, "## 5. 完成定义")
     if "推荐执行顺序" in text:
         errors.append("03-tasks.md v2 不再维护推荐执行顺序；执行顺序由依赖关系决定")
+    if version >= 3:
+        strategy = extract_line_value(text, "- 测试代码策略：").strip()
+        if strategy == "默认不新增":
+            pass
+        elif re.match(r"^用户明确要求[：:（(].+", strategy):
+            if (
+                "记录用户消息定位" in strategy
+                or not re.search(r"用户消息|用户要求|用户确认|授权", strategy)
+            ):
+                errors.append("03-tasks.md v3 测试代码策略缺少可回查的用户授权来源")
+        else:
+            errors.append(
+                "03-tasks.md v3 测试代码策略必须为“默认不新增”"
+                "或记录用户明确要求及授权来源"
+            )
 
     required_headers = ["编号", "开发任务", "所属项目", "依赖任务"]
     headers, rows = extract_first_table(overview)
@@ -4352,6 +5301,7 @@ def assert_tasks_quality_v2(
             valid_design_ids,
             valid_claim_ids,
             schema_exists,
+            sql_draft_exists,
         )
         task_design_ids = design_refs(source)
         covered_design_ids.update(task_design_ids)
@@ -4375,7 +5325,8 @@ def assert_tasks_quality_v2(
 
         task_name = overview_rows.get(task_id, {}).get("开发任务", "")
         code_result_items = task_completion_item_values(block, "代码结果与关键行为")
-        necessary_items = task_completion_item_values(block, "必要测试代码")
+        test_code_label = "测试代码" if version >= 3 else "必要测试代码"
+        necessary_items = task_completion_item_values(block, test_code_label)
         minimum_verification_items = task_completion_item_values(block, "最小验证")
         code_result = code_result_items[0] if len(code_result_items) == 1 else ""
         necessary_test = necessary_items[0] if len(necessary_items) == 1 else ""
@@ -4392,9 +5343,19 @@ def assert_tasks_quality_v2(
             errors.append(f"03-tasks.md {task_id} 完成标准缺少实质的代码结果与关键行为")
 
         if not necessary_items:
-            errors.append(f"03-tasks.md {task_id} 完成标准缺少直接子项: 必要测试代码")
+            errors.append(
+                f"03-tasks.md {task_id} 完成标准缺少直接子项: {test_code_label}"
+            )
         elif len(necessary_items) > 1:
-            errors.append(f"03-tasks.md {task_id} 完成标准的必要测试代码子项重复")
+            errors.append(
+                f"03-tasks.md {task_id} 完成标准的{test_code_label}子项重复"
+            )
+        elif version >= 3:
+            _policy, policy_error = task_v3_test_code_policy(necessary_test)
+            if policy_error:
+                errors.append(
+                    f"03-tasks.md {task_id} 测试代码策略非法: {policy_error}"
+                )
         elif not task_necessary_test_has_substance(necessary_test):
             if normalized_task_completion_value(necessary_test).startswith("不涉及"):
                 errors.append(
@@ -4417,7 +5378,8 @@ def assert_tasks_quality_v2(
             re.IGNORECASE,
         )
         if (
-            risk_pattern.search(risk_text)
+            version < 3
+            and risk_pattern.search(risk_text)
             and normalized_task_completion_value(necessary_test).startswith("不涉及")
         ):
             errors.append(
@@ -4425,6 +5387,17 @@ def assert_tasks_quality_v2(
             )
 
         artifacts = task_artifacts(files)
+        if version >= 3 and len(necessary_items) == 1:
+            test_policy, _policy_error = task_v3_test_code_policy(necessary_test)
+            has_test_artifact = any(is_test_artifact(artifact) for artifact in artifacts)
+            if test_policy == "default_none" and has_test_artifact:
+                errors.append(
+                    f"03-tasks.md {task_id} 声明默认不新增测试代码，但预计修改文件包含测试资产"
+                )
+            if test_policy == "user_authorized" and not has_test_artifact:
+                errors.append(
+                    f"03-tasks.md {task_id} 声明用户明确要求测试代码，但预计修改文件未包含测试资产"
+                )
         production_artifacts = [
             artifact for artifact in artifacts if not is_test_artifact(artifact)
         ]
@@ -4452,14 +5425,23 @@ def assert_tasks_quality_v2(
         for detail_file in sorted(interface_details.glob("*.md")):
             if detail_file.name not in detail and detail_file.stem not in detail:
                 errors.append(f"03-tasks.md 缺少接口明细对应编码任务: {detail_file.name}")
-    if schema_exists:
+    sql_artifact_name = (
+        "sql-draft.sql"
+        if sql_draft_exists
+        else "04-schema.sql"
+        if schema_exists
+        else ""
+    )
+    if sql_artifact_name:
         schema_blocks = [
             (task_id, block)
             for task_id, block in blocks
-            if "04-schema.sql" in block
+            if sql_artifact_name in block
         ]
         if not schema_blocks:
-            errors.append("03-tasks.md 存在 04-schema.sql，但没有任务覆盖 SQL 文件及持久化代码")
+            errors.append(
+                f"03-tasks.md 存在 {sql_artifact_name}，但没有任务覆盖 SQL 文件及持久化代码"
+            )
         else:
             persistence_pattern = re.compile(
                 r"(?:Mapper|Repository|DAO|Entity|JdbcTemplate|DSLContext|MyBatis|JPA|"
@@ -4471,7 +5453,8 @@ def assert_tasks_quality_v2(
                 for _task_id, block in schema_blocks
             ):
                 errors.append(
-                    "03-tasks.md 已引用 04-schema.sql，但对应任务缺少 Mapper/Repository/Entity 等持久化代码落点"
+                    f"03-tasks.md 已引用 {sql_artifact_name}，但对应任务缺少 "
+                    "Mapper/Repository/Entity 等持久化代码落点"
                 )
 
     assert_section_has_substance(detail, "## 4. 任务详情", "03-tasks.md", errors, min_lines=6)
@@ -4589,7 +5572,12 @@ def validate_baseline_doc(path: Path, clarification_gate_required: bool | None =
     text = read_text(path)
     if not text:
         return [f"缺少 {path.name}"]
-    assert_contains(text, BASELINE_REQUIRED_TOKENS, path.name, errors)
+    required_tokens = (
+        BASELINE_V5_REQUIRED_TOKENS
+        if document_schema_version(text) >= 5
+        else BASELINE_REQUIRED_TOKENS
+    )
+    assert_contains(text, required_tokens, path.name, errors)
     assert_baseline_quality(text, errors, clarification_gate_required)
     return errors
 
@@ -4605,9 +5593,12 @@ def validate_research_doc(
         return [f"缺少 {path.name}"]
     if repo_root is None:
         repo_root = infer_repo_root_from_doc(path)
+    version = research_schema_version(text)
     required_tokens = (
-        RESEARCH_V2_REQUIRED_TOKENS
-        if research_schema_version(text) >= 2
+        RESEARCH_V3_REQUIRED_TOKENS
+        if version >= 3
+        else RESEARCH_V2_REQUIRED_TOKENS
+        if version >= 2
         else (
             RESEARCH_REQUIRED_TOKENS
             if "## 8. 结论账本（Claim Ledger）" in text
@@ -4648,7 +5639,9 @@ def validate_design_doc(
     if not text:
         return [f"缺少 {path.name}"]
     version = design_schema_version(text)
-    if version >= 5:
+    if version >= 6:
+        required_tokens = DESIGN_V6_REQUIRED_TOKENS
+    elif version >= 5:
         required_tokens = DESIGN_V5_REQUIRED_TOKENS
     elif version >= 4:
         required_tokens = DESIGN_V4_REQUIRED_TOKENS
@@ -4664,7 +5657,7 @@ def validate_design_doc(
     assert_design_quality(text, errors, valid_claim_ids, eligible_claim_ids, transferred_question_ids)
     if eligible_claim_ids is not None:
         assert_design_claim_eligibility(text, eligible_claim_ids, errors)
-    if version >= 5 and extract_line_value(text, "- MySQL 结构变更：") == "有":
+    if version == 5 and extract_line_value(text, "- MySQL 结构变更：") == "有":
         schema_path = path.parent / "04-schema.sql"
         schema_text = read_text(schema_path)
         if not schema_text:
@@ -4678,7 +5671,22 @@ def validate_design_doc(
         if version >= 2:
             decisions = extract_section(text, "## 十三、设计决策记录")
             decision_ids = extract_decision_ledger_ids(decisions, errors)
-            if version >= 5:
+            if version >= 6:
+                for detail_file in (
+                    sorted(detail_dir.glob("*.md")) if detail_dir.exists() else []
+                ):
+                    if interface_schema_version(read_text(detail_file)) < 4:
+                        errors.append(
+                            f"{detail_file.name} 被 Design v6 引用时必须使用 Interface v4"
+                        )
+                assert_interface_closure_v5(
+                    extract_section(text, "## 三、调用方与接口契约"),
+                    detail_dir,
+                    errors,
+                    decision_ids,
+                    eligible_claim_ids,
+                )
+            elif version >= 5:
                 assert_interface_closure_v5(
                     extract_section(text, "## 三、调用方与接口契约"),
                     detail_dir,
@@ -4826,11 +5834,14 @@ def validate_tasks_doc(
     valid_claim_ids: set[str] | None = None,
     schema_exists: bool = False,
     required_core_design_ids: set[str] | None = None,
+    sql_draft_exists: bool = False,
 ) -> list[str]:
     errors: list[str] = []
     text = read_text(path)
     if not text:
         return [f"缺少 {path.name}"]
+    if not sql_draft_exists:
+        sql_draft_exists = (path.parent / "sql-draft.sql").exists()
     marker_mentions = text.count("GGG_TASK_SCHEMA_VERSION")
     marker_matches = re.findall(
         r"<!--\s*GGG_TASK_SCHEMA_VERSION:\s*(\d+)\s*-->",
@@ -4838,11 +5849,17 @@ def validate_tasks_doc(
     )
     if marker_mentions and len(marker_matches) != 1:
         errors.append("03-tasks.md 的 GGG_TASK_SCHEMA_VERSION 标记畸形或重复，不能降级为 legacy")
-    elif marker_matches and marker_matches[0] != "2":
+    elif marker_matches and marker_matches[0] not in {"2", "3", "4"}:
         errors.append(f"03-tasks.md 使用不支持的 task schema 版本: {marker_matches[0]}")
 
     version = task_schema_version(text)
-    required_tokens = TASK_V2_REQUIRED_TOKENS if version >= 2 else TASK_REQUIRED_TOKENS
+    required_tokens = (
+        TASK_V3_REQUIRED_TOKENS
+        if version >= 3
+        else TASK_V2_REQUIRED_TOKENS
+        if version >= 2
+        else TASK_REQUIRED_TOKENS
+    )
     assert_contains(text, required_tokens, path.name, errors)
     assert_no_unresolved_placeholders(text, path.name, errors)
     if required_core_design_ids is None:
@@ -4857,6 +5874,7 @@ def validate_tasks_doc(
             valid_claim_ids,
             schema_exists,
             required_core_design_ids,
+            sql_draft_exists,
         )
     else:
         assert_tasks_quality(
@@ -5255,6 +6273,70 @@ def validate_quick_review_evidence(
     if not path.exists():
         return [f"缺少 quick 记录: {path}"]
     text = read_text(path)
+    if quick_schema_version(text) >= 4:
+        return validate_optional_review(
+            path,
+            "passed",
+            extract_line_value(text, "- Review 对应实现轮次："),
+            extract_line_value(text, "- Review 对应差异指纹："),
+        )
+    if quick_schema_version(text) >= 3:
+        errors: list[str] = []
+        disposition = extract_line_value(text, "- Review 处置：").strip()
+        result = extract_line_value(text, "- Review 结论：").strip()
+        gate_satisfied = extract_line_value(
+            text,
+            "- Review Gate 是否满足：",
+        ).strip()
+        issue_value = extract_line_value(
+            text,
+            "- Review 未关闭阻塞/必须修问题：",
+        ).strip()
+        if disposition not in {"light", "formal", "skipped"}:
+            return ["quick.md v3 Review 处置必须为 light、formal 或 skipped"]
+        if gate_satisfied != "是":
+            errors.append("quick.md v3 Review Gate 是否满足必须为“是”")
+        if disposition == "skipped":
+            if result != "已跳过":
+                errors.append("quick.md v3 skipped Review 的结论必须为“已跳过”")
+            skip_source = extract_line_value(text, "- Review 跳过来源：").strip()
+            if (
+                not meaningful_design_value(skip_source)
+                or skip_source in {"用户消息", "已确认 quick 规则", "其他具体来源"}
+            ):
+                errors.append("quick.md v3 skipped Review 必须记录可回查的跳过来源")
+            return errors
+        if result != "通过":
+            errors.append("quick.md v3 Review 通过登记时结论必须为“通过”")
+        if issue_value not in {"无", "不涉及"}:
+            errors.append("quick Review 通过前必须明确没有未关闭阻塞/必须修问题")
+        if not any(
+            line.strip().startswith("- Review 剩余风险：")
+            for line in text.splitlines()
+        ):
+            errors.append("quick Review 缺少剩余风险记录")
+        if disposition == "light":
+            summary = extract_line_value(
+                text,
+                "- Light Review 简要结论：",
+            ).strip()
+            if (
+                not meaningful_design_value(summary)
+                or summary.startswith("不涉及")
+                or "逻辑、代码和文档的简洁复核结论" in summary
+            ):
+                errors.append("quick.md v3 light Review 缺少逻辑、代码或文档的简洁复核结论")
+            return errors
+
+        section = extract_section(
+            text,
+            "### 5.1 Formal Review 两门复核（仅 formal）",
+        )
+        tables = iter_markdown_tables(section)
+        if len(tables) < 2:
+            return errors + ["quick formal Review 缺少两门复核表或完整 Diff 覆盖表"]
+        return errors + validate_quick_formal_review_tables(tables, actual_paths)
+
     provenance_errors = validate_review_provenance(
         text,
         "quick.md",
@@ -5332,6 +6414,64 @@ def validate_quick_review_evidence(
         errors.append("quick Review 未覆盖本轮实际文件: " + ", ".join(missing))
     if extra:
         errors.append("quick Review 覆盖了非本轮文件: " + ", ".join(extra))
+    return errors
+
+
+def validate_quick_formal_review_tables(
+    tables: list[tuple[list[str], list[list[str]]]],
+    actual_paths: set[str],
+) -> list[str]:
+    """校验 quick v3 仅在 formal 处置下要求的两门复核与完整 Diff 覆盖。"""
+    errors: list[str] = []
+    headers, rows = tables[0]
+    required_headers = ["Gate", "检查面", "结论", "独立证据或 CRxx"]
+    if not all(header in headers for header in required_headers):
+        return ["quick formal Review 两门复核缺少关键表头"]
+    rows_by_item = {table_cell(headers, row, "检查面"): row for row in rows}
+    for item in [
+        "目标、禁止项与行为",
+        "契约、数据、权限、兼容与越界",
+        "正确性、安全、失败边界与副作用",
+        "可维护性、触发风险与验证充分性",
+    ]:
+        row = rows_by_item.get(item)
+        if row is None:
+            errors.append(f"quick formal Review 两门复核缺少检查面: {item}")
+            continue
+        if table_cell(headers, row, "结论") != "通过":
+            errors.append(f"quick formal Review 的“{item}”必须明确为通过")
+        if table_cell(headers, row, "独立证据或 CRxx") in EMPTY_VALUES:
+            errors.append(f"quick formal Review 的“{item}”缺少独立证据")
+
+    coverage_headers, coverage_rows = tables[1]
+    required_coverage = ["Diff 路径", "Gate A", "Gate B", "独立证据或 CRxx"]
+    if not all(header in coverage_headers for header in required_coverage):
+        return errors + ["quick formal Review 完整 Diff 覆盖表缺少关键表头"]
+    covered: set[str] = set()
+    for row in coverage_rows:
+        paths = extract_quality_paths(table_cell(coverage_headers, row, "Diff 路径"))
+        if not paths:
+            continue
+        if len(paths) != 1:
+            errors.append("quick formal Review 每个覆盖行必须且只能记录一个 Diff 路径")
+            continue
+        diff_path = next(iter(paths))
+        if diff_path in covered:
+            errors.append(f"quick formal Review Diff 路径重复: {diff_path}")
+        covered.add(diff_path)
+        if table_cell(coverage_headers, row, "Gate A") != "通过":
+            errors.append(f"quick formal Review {diff_path} Gate A 未通过")
+        if table_cell(coverage_headers, row, "Gate B") != "通过":
+            errors.append(f"quick formal Review {diff_path} Gate B 未通过")
+        if table_cell(coverage_headers, row, "独立证据或 CRxx") in EMPTY_VALUES:
+            errors.append(f"quick formal Review {diff_path} 缺少独立证据")
+    expected = {normalize_quality_path(value) for value in actual_paths}
+    missing = sorted(expected - covered)
+    extra = sorted(covered - expected)
+    if missing:
+        errors.append("quick formal Review 未覆盖本轮实际文件: " + ", ".join(missing))
+    if extra:
+        errors.append("quick formal Review 覆盖了非本轮文件: " + ", ".join(extra))
     return errors
 
 
@@ -5482,6 +6622,137 @@ def validate_high_frequency_quality_table(
     return errors
 
 
+IMPLEMENTATION_V2_EVIDENCE_ITEMS = [
+    "ID / 大整数精度",
+    "Request / Response / DTO 字段注释",
+    "异常 / 错误码",
+    "业务日志",
+    "Trace 链路",
+    "测试代码是否修改及用户授权",
+]
+
+
+def has_concrete_implementation_evidence(value: str) -> bool:
+    normalized = value.strip().strip("`")
+    return (
+        len(normalized) >= 4
+        and normalized not in EMPTY_VALUES
+        and normalized
+        not in {
+            "文件:行号/命令",
+            "用户消息定位",
+            "具体原因",
+        }
+    )
+
+
+def validate_implementation_v2_independent_evidence(
+    text: str,
+    latest_round: str,
+    section_heading: str = "### 4.2 独立契约与可观测性证据",
+    record_label: str = "05-implementation-log.md",
+    actual_paths: set[str] | None = None,
+) -> list[str]:
+    """校验 v2 每轮独立契约、可观测性和测试代码授权证据。"""
+    label = f"{record_label} 独立契约与可观测性证据"
+    section = extract_section(text, section_heading)
+    headers, rows = extract_first_table(section)
+    required_headers = [
+        "轮次",
+        "检查项",
+        "结论",
+        "独立证据（文件:行号/命令）",
+        "不涉及原因或用户授权",
+    ]
+    if not all(header in headers for header in required_headers):
+        return [f"{label} 缺少关键表头: {', '.join(required_headers)}"]
+
+    current_rows = [
+        row
+        for row in rows
+        if table_cell(headers, row, "轮次") == latest_round
+    ]
+    rows_by_item: dict[str, list[list[str]]] = {}
+    for row in current_rows:
+        rows_by_item.setdefault(
+            table_cell(headers, row, "检查项"),
+            [],
+        ).append(row)
+
+    errors: list[str] = []
+    for item in IMPLEMENTATION_V2_EVIDENCE_ITEMS:
+        item_rows = rows_by_item.get(item, [])
+        if not item_rows:
+            errors.append(f"{label} {latest_round} 缺少检查项: {item}")
+            continue
+        if len(item_rows) > 1:
+            errors.append(f"{label} {latest_round} 检查项重复: {item}")
+            continue
+        row = item_rows[0]
+        result = table_cell(headers, row, "结论")
+        evidence = table_cell(
+            headers,
+            row,
+            "独立证据（文件:行号/命令）",
+        )
+        reason = table_cell(headers, row, "不涉及原因或用户授权")
+
+        if item == "测试代码是否修改及用户授权":
+            test_paths = sorted(
+                path for path in (actual_paths or set()) if is_test_artifact(path)
+            )
+            if result not in {"未修改", "已授权并修改", "有问题"}:
+                errors.append(
+                    f"{label} 的“{item}”结论必须为未修改、已授权并修改或有问题"
+                )
+                continue
+            if result == "有问题":
+                errors.append(f"{label} 的“{item}”仍有问题，不能完成当前实现轮次")
+            if not has_concrete_implementation_evidence(evidence):
+                errors.append(f"{label} 的“{item}”缺少独立差异或命令证据")
+            if result == "未修改":
+                if test_paths:
+                    errors.append(
+                        f"{label} 声明未修改测试代码，但当前差异包含测试资产: "
+                        + ", ".join(test_paths)
+                    )
+                normalized_reason = reason.strip()
+                if not (
+                    normalized_reason.startswith("不涉及：")
+                    and len(normalized_reason.removeprefix("不涉及：").strip()) >= 4
+                ):
+                    errors.append(f"{label} 的“{item}”未修改时必须写明不涉及原因")
+            elif result == "已授权并修改" and not has_concrete_implementation_evidence(
+                reason
+            ):
+                errors.append(f"{label} 的“{item}”缺少可回查的用户授权来源")
+            elif result == "已授权并修改" and not test_paths:
+                errors.append(
+                    f"{label} 声明已授权并修改测试代码，但当前差异未发现测试资产"
+                )
+            continue
+
+        if result not in {"通过", "有问题", "不涉及"}:
+            errors.append(
+                f"{label} 的“{item}”结论必须为通过、有问题或不涉及"
+            )
+            continue
+        if result == "有问题":
+            errors.append(f"{label} 的“{item}”仍有问题，不能完成当前实现轮次")
+            if not has_concrete_implementation_evidence(evidence):
+                errors.append(f"{label} 的“{item}”缺少问题定位证据")
+        elif result == "不涉及":
+            normalized_reason = reason.strip()
+            if not (
+                normalized_reason.startswith("不涉及：")
+                and len(normalized_reason.removeprefix("不涉及：").strip()) >= 4
+            ):
+                errors.append(f"{label} 的“{item}”必须写明具体不涉及原因")
+        elif not has_concrete_implementation_evidence(evidence):
+            errors.append(f"{label} 的“{item}”缺少独立文件行号或命令证据")
+    return errors
+
+
 def validate_legacy_implementation_completion(path: Path, errors: list[str]) -> list[str]:
     """兼容旧版 full 实现记录，不要求用户立即迁移历史需求目录。"""
     text = read_text(path)
@@ -5622,6 +6893,14 @@ def validate_implementation_completion(
             latest_round,
         )
     )
+    if implementation_schema_version(text) >= 2:
+        errors.extend(
+            validate_implementation_v2_independent_evidence(
+                text,
+                latest_round,
+                actual_paths=latest_paths,
+            )
+        )
 
     validation_headers, validation_rows = extract_first_table(extract_section(text, "## 3. 验证记录"))
     latest_validations = [
@@ -5667,7 +6946,7 @@ def validate_quick_boundary_ready(path: Path) -> list[str]:
     )
     if marker_mentions and len(marker_matches) != 1:
         errors.append("quick.md 的 GGG_QUICK_SCHEMA_VERSION 标记畸形或重复，不能降级为 legacy")
-    elif marker_matches and marker_matches[0] != "2":
+    elif marker_matches and marker_matches[0] not in {"2", "3", "4"}:
         errors.append(f"quick.md 使用不支持的 schema 版本: {marker_matches[0]}")
 
     if extract_line_value(boundary, "- 澄清状态：") != "已确认":
@@ -5687,24 +6966,52 @@ def validate_quick_boundary_ready(path: Path) -> list[str]:
         if not extract_line_value(boundary, prefix).strip():
             errors.append(f"quick.md 边界确认缺少实质内容: {prefix.rstrip('：')}")
 
-    strict = quick_schema_version(text) >= 2
+    version = quick_schema_version(text)
+    strict = version >= 2
     if strict:
         mode = extract_line_value(boundary, "- 推进模式：").strip()
-        if mode not in {
-            "quick（自动路由并已告知）",
-            "quick（用户明确指定）",
-            "quick(自动路由并已告知)",
-            "quick(用户明确指定)",
-        }:
-            errors.append("quick.md v2 必须明确推进模式及自动路由/用户指定来源")
+        if version >= 3:
+            if mode != "quick":
+                errors.append(f"quick.md v{version} 推进模式必须为 quick")
+            recommended_mode = extract_line_value(boundary, "- 推荐模式：").strip()
+            recommendation_reason = extract_line_value(boundary, "- 推荐依据：").strip()
+            selected_mode = extract_line_value(boundary, "- 最终模式：").strip()
+            selection_source = extract_line_value(boundary, "- 模式选择来源：").strip()
+            if recommended_mode not in {"quick", "full"}:
+                errors.append(f"quick.md v{version} 推荐模式必须为 quick 或 full")
+            if selected_mode != "quick":
+                errors.append(f"quick.md v{version} 的最终模式必须由用户选择为 quick")
+            for value, label in [
+                (recommendation_reason, "推荐依据"),
+                (selection_source, "模式选择来源"),
+            ]:
+                if (
+                    not meaningful_design_value(value)
+                    or vague_design_value(value)
+                    or "{{" in value
+                    or value in {"用户消息", "用户选择", "AI决定", "已授权"}
+                    or any(
+                        token in value
+                        for token in ["待确认", "TODO", "TBD", "按需", "视情况"]
+                    )
+                ):
+                    errors.append(f"quick.md v{version} {label}缺少可回查的实质内容")
+        else:
+            if mode not in {
+                "quick（自动路由并已告知）",
+                "quick（用户明确指定）",
+                "quick(自动路由并已告知)",
+                "quick(用户明确指定)",
+            }:
+                errors.append("quick.md v2 必须明确推进模式及自动路由/用户指定来源")
 
-        route_reason = extract_line_value(boundary, "- 路由依据：").strip()
-        if (
-            not meaningful_design_value(route_reason)
-            or vague_design_value(route_reason)
-            or any(token in route_reason for token in ["待确认", "TODO", "TBD", "按需", "视情况"])
-        ):
-            errors.append("quick.md v2 路由依据缺少实质内容")
+            route_reason = extract_line_value(boundary, "- 路由依据：").strip()
+            if (
+                not meaningful_design_value(route_reason)
+                or vague_design_value(route_reason)
+                or any(token in route_reason for token in ["待确认", "TODO", "TBD", "按需", "视情况"])
+            ):
+                errors.append("quick.md v2 路由依据缺少实质内容")
 
         confirmation_evidence = (
             final_confirmation[len("已确认"):]
@@ -5717,7 +7024,9 @@ def validate_quick_boundary_ready(path: Path) -> list[str]:
             or confirmation_evidence in {"用户消息", "确认时间", "记录用户消息或确认时间"}
             or any(token in confirmation_evidence for token in unresolved_quick_tokens)
         ):
-            errors.append("quick.md v2 最终边界确认必须记录用户消息定位或确认时间")
+            errors.append(
+                f"quick.md v{version} 最终边界确认必须记录用户消息定位或确认时间"
+            )
 
         for prefix in core_prefixes:
             value = extract_line_value(boundary, prefix).strip().strip("`")
@@ -5726,7 +7035,9 @@ def validate_quick_boundary_ready(path: Path) -> list[str]:
                 or vague_design_value(value)
                 or any(token in value for token in ["待确认", "TODO", "TBD", "待补充", "未知"])
             ):
-                errors.append(f"quick.md v2 边界字段仍未收口: {prefix.rstrip('：')}")
+                errors.append(
+                    f"quick.md v{version} 边界字段仍未收口: {prefix.rstrip('：')}"
+                )
 
         for prefix, label in [
             ("- 代表性验收例：", "代表性验收例"),
@@ -5734,7 +7045,7 @@ def validate_quick_boundary_ready(path: Path) -> list[str]:
             ("- 兼容性检查：", "兼容性检查"),
         ]:
             if prefix not in boundary:
-                errors.append(f"quick.md v2 缺少强制字段：{label}")
+                errors.append(f"quick.md v{version} 缺少强制字段：{label}")
 
     if "- 代表性验收例：" in boundary:
         example = extract_line_value(boundary, "- 代表性验收例：").strip().strip("`")
@@ -5768,7 +7079,9 @@ def validate_quick_boundary_ready(path: Path) -> list[str]:
             or retry == "不涉及"
             or (retry.startswith("不涉及") and not re.match(r"^不涉及[：:].+", retry))
         ):
-            errors.append("quick.md v2 失败 / 重复触发补充必须写明具体口径或“不涉及：原因”")
+            errors.append(
+                f"quick.md v{version} 失败 / 重复触发补充必须写明具体口径或“不涉及：原因”"
+            )
 
     if "- 兼容性检查：" in boundary:
         compatibility = extract_line_value(boundary, "- 兼容性检查：").strip().strip("`")
@@ -5792,7 +7105,9 @@ def validate_quick_boundary_ready(path: Path) -> list[str]:
                 parsed.setdefault(label, []).append(value)
             expected_labels = {"现有调用方", "历史数据", "重复请求或重试"}
             if set(parsed) != expected_labels:
-                errors.append("quick.md v2 兼容性检查必须且只能覆盖现有调用方、历史数据、重复请求或重试")
+                errors.append(
+                    f"quick.md v{version} 兼容性检查必须且只能覆盖现有调用方、历史数据、重复请求或重试"
+                )
             for label in expected_labels:
                 values = parsed.get(label, [])
                 if (
@@ -5800,7 +7115,9 @@ def validate_quick_boundary_ready(path: Path) -> list[str]:
                     or not meaningful_design_value(values[0])
                     or any(token in values[0] for token in unresolved_quick_tokens)
                 ):
-                    errors.append(f"quick.md v2 兼容性检查缺少已收口项：{label}")
+                    errors.append(
+                        f"quick.md v{version} 兼容性检查缺少已收口项：{label}"
+                    )
 
     question_tables = [
         (headers, rows)
@@ -5808,7 +7125,7 @@ def validate_quick_boundary_ready(path: Path) -> list[str]:
         if "疑问" in headers or "状态" in headers
     ]
     if strict and len(question_tables) != 1:
-        errors.append("quick.md v2 必须且只能有一个疑问账本")
+        errors.append(f"quick.md v{version} 必须且只能有一个疑问账本")
 
     for headers, rows in question_tables:
         required_headers = (
@@ -5819,7 +7136,7 @@ def validate_quick_boundary_ready(path: Path) -> list[str]:
         missing_headers = [header for header in required_headers if header not in headers]
         if missing_headers:
             errors.append(
-                f"quick.md {'v2 ' if strict else ''}疑问账本缺少列: "
+                f"quick.md {f'v{version} ' if strict else ''}疑问账本缺少列: "
                 + ", ".join(missing_headers)
             )
             continue
@@ -5916,6 +7233,20 @@ def validate_quick_implementation_completion(path: Path) -> list[str]:
             "quick.md 代码质量自检",
         )
     )
+    if quick_schema_version(text) >= 3:
+        latest_round = extract_line_value(text, "- 当前实现轮次：")
+        if not re.fullmatch(r"I\d+", latest_round):
+            errors.append("quick.md 缺少有效当前实现轮次，无法校验独立契约与可观测性证据")
+        else:
+            errors.extend(
+                validate_implementation_v2_independent_evidence(
+                    text,
+                    latest_round,
+                    section_heading="#### 4.1.1 独立契约与可观测性证据",
+                    record_label="quick.md",
+                    actual_paths=actual_quality_paths,
+                )
+            )
     if not extract_line_value(text, "- 完成标准证据："):
         errors.append("quick.md 缺少完成标准证据")
     validation_method = extract_line_value(text, "- 验证命令 / 方式：")
@@ -5932,10 +7263,132 @@ def validate_quick_implementation_completion(path: Path) -> list[str]:
     return errors
 
 
+OPTIONAL_REVIEW_ITEMS = ["代码与需求是否有偏差", "代码质量与格式"]
+
+
+def validate_optional_review(
+    record: Path,
+    result: str,
+    expected_implementation_round: str,
+    expected_fingerprint: str,
+) -> list[str]:
+    """校验单一可选 Review，只保留需求偏差、代码质量与格式两项。"""
+    expected_label = {
+        "passed": "通过",
+        "needs_changes": "需修改",
+        "blocked": "阻塞",
+    }[result]
+    if record.name == "quick.md":
+        if not record.exists():
+            return ["缺少 quick.md"]
+        text = read_text(record)
+        section = extract_section(text, "### 5.1 可选 Review")
+        errors: list[str] = []
+        if quick_schema_version(text) < 4:
+            return ["quick.md 不是可选 Review v4 工件"]
+        if extract_line_value(text, "- Review 状态：") != "已执行":
+            errors.append("quick.md Review 状态必须为“已执行”")
+        if extract_line_value(text, "- Review 结论：") != expected_label:
+            errors.append(f"quick.md Review 结论必须为“{expected_label}”")
+        if extract_line_value(text, "- Review 对应实现轮次：") != expected_implementation_round:
+            errors.append("quick.md Review 对应实现轮次不一致")
+        if extract_line_value(text, "- Review 对应差异指纹：") != expected_fingerprint:
+            errors.append("quick.md Review 对应差异指纹不一致")
+        unresolved = extract_line_value(text, "- Review 未解决问题：").strip()
+        label = "quick.md"
+    else:
+        path = record.parent / "06-code-review.md"
+        if not path.exists():
+            return ["缺少 06-code-review.md"]
+        text = read_text(path)
+        section = extract_section(text, "## 2. 两项检查")
+        errors = []
+        assert_contains(text, CODE_REVIEW_SIMPLE_REQUIRED_TOKENS, path.name, errors)
+        if extract_line_value(text, "- 对应实现轮次：") != expected_implementation_round:
+            errors.append("06-code-review.md 对应实现轮次不一致")
+        if extract_line_value(text, "- 实现差异指纹：") != expected_fingerprint:
+            errors.append("06-code-review.md 实现差异指纹不一致")
+        for prefix in ["- 需求依据：", "- 检查范围："]:
+            value = extract_line_value(text, prefix).strip()
+            if not meaningful_design_value(value) or value in EMPTY_VALUES:
+                errors.append(f"06-code-review.md 缺少实质内容: {prefix}")
+        if extract_line_value(text, "- 结论：") != expected_label:
+            errors.append(f"06-code-review.md 结论必须为“{expected_label}”")
+        unresolved = extract_line_value(text, "- 未解决问题：").strip()
+        label = "06-code-review.md"
+
+    headers, rows = extract_first_table(section)
+    required_headers = ["检查项", "结论", "问题与定位"]
+    if not all(header in headers for header in required_headers):
+        return errors + [f"{label} 可选 Review 表缺少关键表头"]
+    by_item: dict[str, list[list[str]]] = {}
+    actual_items: list[str] = []
+    for row in rows:
+        item = table_cell(headers, row, "检查项")
+        if item:
+            actual_items.append(item)
+            by_item.setdefault(item, []).append(row)
+    unknown_items = sorted(set(actual_items) - set(OPTIONAL_REVIEW_ITEMS))
+    if unknown_items:
+        errors.append(f"{label} 只允许两项检查，不应包含: " + "、".join(unknown_items))
+    if len(actual_items) != len(OPTIONAL_REVIEW_ITEMS):
+        errors.append(f"{label} 必须恰好包含两条检查")
+    conclusions: list[str] = []
+    for item in OPTIONAL_REVIEW_ITEMS:
+        matches = by_item.get(item, [])
+        if len(matches) != 1:
+            errors.append(f"{label} 必须且只能有一条“{item}”")
+            continue
+        row = matches[0]
+        conclusion = table_cell(headers, row, "结论")
+        problem = table_cell(headers, row, "问题与定位").strip()
+        conclusions.append(conclusion)
+        if conclusion not in {"通过", "有问题", "阻塞"}:
+            errors.append(f"{label} 的“{item}”结论无效")
+        if conclusion == "通过":
+            if problem not in {"无", "不涉及"}:
+                errors.append(f"{label} 的“{item}”通过时问题与定位应为“无”")
+        elif (
+            problem in EMPTY_VALUES
+            or "文件:行号" in problem
+            or len(problem) < 8
+        ):
+            errors.append(f"{label} 的“{item}”有问题或阻塞时必须写明定位和影响")
+
+    if result == "passed" and conclusions != ["通过", "通过"]:
+        errors.append(f"{label} 登记通过时两项检查都必须为通过")
+    if result == "needs_changes" and "有问题" not in conclusions:
+        errors.append(f"{label} 登记需修改时至少一项必须为有问题")
+    if result == "blocked" and "阻塞" not in conclusions:
+        errors.append(f"{label} 登记阻塞时至少一项必须为阻塞")
+    if result == "passed" and unresolved not in {"无", "不涉及"}:
+        errors.append(f"{label} 通过时必须明确没有未解决问题")
+    if result != "passed" and (
+        unresolved in EMPTY_VALUES
+        or unresolved in {"无", "不涉及", "具体问题"}
+    ):
+        errors.append(f"{label} 非通过结论必须记录未解决问题")
+    return errors
+
+
 def validate_code_review_artifacts(index_path: Path, rounds_dir: Path) -> list[str]:
     errors: list[str] = []
     if index_path.exists():
         text = read_text(index_path)
+        if review_schema_version(text) >= 2:
+            assert_contains(
+                text,
+                CODE_REVIEW_SIMPLE_REQUIRED_TOKENS,
+                index_path.name,
+                errors,
+            )
+            assert_table_has_headers(
+                extract_section(text, "## 2. 两项检查"),
+                ["检查项", "结论", "问题与定位"],
+                "06-code-review.md 可选 Review 表缺少关键表头",
+                errors,
+            )
+            return errors
         assert_contains(
             text,
             CODE_REVIEW_INDEX_REQUIRED_TOKENS[:2],
@@ -5971,6 +7424,31 @@ def validate_code_review_artifacts(index_path: Path, rounds_dir: Path) -> list[s
                     f"{round_file.name} 问题清单缺少关键表头",
                     errors,
                 )
+            elif (
+                "# Light Code Review 轮次明细" in text
+                or extract_line_value(text, "- Review disposition：") == "light"
+            ):
+                assert_contains(
+                    text,
+                    [
+                        "## 1. 基本信息",
+                        "## 2. Light Review 结论",
+                        "- 业务逻辑结论：",
+                        "- 代码质量结论：",
+                        "- 文档一致性结论：",
+                        "- 契约 / SQL 结论：",
+                        "- 异常 / 日志 / Trace 结论：",
+                        "## 3. 评审结论",
+                    ],
+                    round_file.name,
+                    errors,
+                )
+                assert_table_has_headers(
+                    extract_section(text, "## 2. Light Review 结论"),
+                    ["定位", "类型", "问题或确认事实", "影响", "处理"],
+                    f"{round_file.name} Light Review 结论表缺少关键表头",
+                    errors,
+                )
             else:
                 legacy_tokens = [
                     "## 1. 基本信息",
@@ -5987,6 +7465,71 @@ def validate_code_review_artifacts(index_path: Path, rounds_dir: Path) -> list[s
                     f"{round_file.name} 问题清单缺少关键表头: 级别、文件行号、问题、状态",
                     errors,
                 )
+    return errors
+
+
+def validate_light_code_review_completion(
+    index_path: Path,
+    rounds_dir: Path,
+    expected_implementation_round: str | None = None,
+    expected_fingerprint: str | None = None,
+) -> list[str]:
+    """验证新版 light Review 的最小逻辑、代码、契约和文档证据。"""
+    errors = validate_code_review_artifacts(index_path, rounds_dir)
+    if not index_path.exists():
+        return errors or ["缺少 06-code-review.md"]
+    index_text = read_text(index_path)
+    if extract_line_value(index_text, "- Review disposition：") != "light":
+        errors.append("06-code-review.md Review disposition 必须为 light")
+    if extract_line_value(index_text, "- 当前结论：") != "通过":
+        errors.append("06-code-review.md light Review 当前结论必须为“通过”")
+    if extract_line_value(index_text, "- Review 门禁是否满足：") not in {"是", "通过"}:
+        errors.append("06-code-review.md light Review 门禁必须为“是”")
+
+    round_files = (
+        sorted(
+            rounds_dir.glob("review-r*.md"),
+            key=lambda path: (review_round_number(path), path.name),
+        )
+        if rounds_dir.exists()
+        else []
+    )
+    if not round_files:
+        errors.append("light Review 缺少 review-rNN.md 明细")
+        return errors
+    latest = round_files[-1]
+    text = read_text(latest)
+    if extract_line_value(text, "- Review disposition：") != "light":
+        errors.append(f"{latest.name} Review disposition 必须为 light")
+    if extract_line_value(text, "- 结论：") != "通过":
+        errors.append(f"{latest.name} light Review 结论必须为“通过”")
+    if extract_line_value(text, "- 是否可进入测试验证：") not in {"是", "允许"}:
+        errors.append(f"{latest.name} light Review 必须明确允许进入测试验证")
+    if extract_line_value(text, "- 需要回到实现阶段的问题：") not in {"无", "不涉及"}:
+        errors.append(f"{latest.name} light Review 仍有需要回到实现阶段的问题")
+
+    for prefix in [
+        "- 业务逻辑结论：",
+        "- 代码质量结论：",
+        "- 文档一致性结论：",
+    ]:
+        if extract_line_value(text, prefix) != "通过":
+            errors.append(f"{latest.name} 通过时 {prefix}必须为通过")
+    for prefix in ["- 契约 / SQL 结论：", "- 异常 / 日志 / Trace 结论："]:
+        value = extract_line_value(text, prefix)
+        if value != "通过" and not (
+            value.startswith("不涉及：") and len(value) > len("不涉及：")
+        ):
+            errors.append(
+                f"{latest.name} 通过时 {prefix}必须为通过或“不涉及：具体原因”"
+            )
+
+    recorded_round = extract_line_value(text, "- 对应实现轮次：")
+    recorded_fingerprint = extract_line_value(text, "- 实现差异指纹：")
+    if expected_implementation_round and recorded_round != expected_implementation_round:
+        errors.append(f"{latest.name} 对应实现轮次与当前完成快照不一致")
+    if expected_fingerprint and recorded_fingerprint != expected_fingerprint:
+        errors.append(f"{latest.name} 实现差异指纹与当前完成快照不一致")
     return errors
 
 
@@ -6768,6 +8311,66 @@ def validate_quick_review_nonpass(
         return ["缺少 quick.md"]
     text = read_text(path)
     expected = "需修改" if result == "needs_changes" else "阻塞"
+    if quick_schema_version(text) >= 4:
+        return validate_optional_review(
+            path,
+            result,
+            extract_line_value(text, "- Review 对应实现轮次："),
+            extract_line_value(text, "- Review 对应差异指纹："),
+        )
+    if quick_schema_version(text) >= 3:
+        errors: list[str] = []
+        disposition = extract_line_value(text, "- Review 处置：").strip()
+        recorded_result = extract_line_value(text, "- Review 结论：").strip()
+        gate_satisfied = extract_line_value(
+            text,
+            "- Review Gate 是否满足：",
+        ).strip()
+        if disposition not in {"light", "formal"}:
+            errors.append("quick.md v3 非通过 Review 的处置必须为 light 或 formal")
+        if recorded_result != expected:
+            errors.append(f"quick.md v3 Review 结论必须为{expected}")
+        if gate_satisfied != "否":
+            errors.append("quick.md v3 非通过 Review 的 Gate 是否满足必须为“否”")
+        issue = extract_line_value(
+            text,
+            "- Review 未关闭阻塞/必须修问题：",
+        ).strip()
+        if issue in EMPTY_VALUES or issue in {"无", "不涉及"}:
+            errors.append(f"quick Review {expected}必须记录未关闭问题")
+        if disposition == "light":
+            summary = extract_line_value(
+                text,
+                "- Light Review 简要结论：",
+            ).strip()
+            if not meaningful_design_value(summary) or summary.startswith("不涉及"):
+                errors.append("quick.md v3 light Review 缺少简洁复核结论")
+            return errors
+        section = extract_section(
+            text,
+            "### 5.1 Formal Review 两门复核（仅 formal）",
+        )
+        tables = iter_markdown_tables(section)
+        if len(tables) < 2:
+            return errors + ["quick formal Review 缺少两门复核表或 Diff 覆盖表"]
+        coverage_headers, coverage_rows = tables[1]
+        covered: set[str] = set()
+        for row in coverage_rows:
+            paths = extract_quality_paths(
+                table_cell(coverage_headers, row, "Diff 路径")
+            )
+            if len(paths) == 1:
+                covered.update(paths)
+        missing = {
+            normalize_quality_path(value) for value in actual_paths
+        } - covered
+        if missing:
+            errors.append(
+                "quick formal Review 非通过结论仍遗漏 Diff 文件: "
+                + ", ".join(sorted(missing))
+            )
+        return errors
+
     gate_values = {
         extract_line_value(text, "- Review Gate A："),
         extract_line_value(text, "- Review Gate B："),
@@ -7423,8 +9026,13 @@ def validate_test_report_completion(
         errors.append("07-test-report.md 正式通过只能来自 formal-gate")
     if extract_line_value(index_text, "- 测试阶段是否完成：") not in {"是", "已完成"}:
         errors.append("07-test-report.md 必须明确测试阶段已完成")
-    if extract_line_value(index_text, "- 需要回到实现或评审的问题：") not in {"无", "不涉及"}:
-        errors.append("07-test-report.md 通过时不能保留需回到实现或评审的问题")
+    return_prefix = (
+        "- 需要回到实现的问题："
+        if "- 需要回到实现的问题：" in index_text
+        else "- 需要回到实现或评审的问题："
+    )
+    if extract_line_value(index_text, return_prefix) not in {"无", "不涉及"}:
+        errors.append("07-test-report.md 通过时不能保留需回到实现的问题")
 
     round_files = (
         sorted(rounds_dir.glob("test-r*.md"), key=lambda path: (test_round_number(path), path.name))
@@ -7461,7 +9069,7 @@ def validate_test_report_completion(
         errors.append(f"{latest_round.name} 缺少有效对应实现轮次")
     if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
         errors.append(f"{latest_round.name} 缺少有效的 64 位实现差异指纹")
-    if not re.fullmatch(r"R\d+", review_round):
+    if expected_review_round and not re.fullmatch(r"R\d+|quick|skipped", review_round):
         errors.append(f"{latest_round.name} 缺少有效对应 Review 轮次")
     if expected_implementation_round and implementation_round != expected_implementation_round:
         errors.append(f"{latest_round.name} 对应实现轮次与当前实现不一致")
@@ -7548,7 +9156,7 @@ def validate_test_report_nonpass(
     result: str,
     expected_implementation_round: str,
     expected_fingerprint: str,
-    expected_review_round: str,
+    expected_review_round: str | None,
 ) -> list[str]:
     """校验需补测/阻塞也有真实轮次、来源、场景和可复现原因。"""
     errors = validate_test_report_artifacts(index_path, rounds_dir)
@@ -7583,7 +9191,7 @@ def validate_test_report_nonpass(
         errors.append(f"{latest.name} 对应实现轮次与当前实现不一致")
     if extract_line_value(text, "- 实现差异指纹：") != expected_fingerprint:
         errors.append(f"{latest.name} 实现差异指纹与当前实现不一致")
-    if extract_line_value(text, "- 对应 Review 轮次：") != expected_review_round:
+    if expected_review_round and extract_line_value(text, "- 对应 Review 轮次：") != expected_review_round:
         errors.append(f"{latest.name} 对应 Review 轮次不一致")
     round_id = extract_line_value(text, "- 轮次：")
     if round_id != f"T{test_round_number(latest)}":
@@ -7725,7 +9333,7 @@ def validate_quick_test_evidence(
     source_text = "\n".join(table_cell(headers, row, "来源依据") for row in rows)
     if not any(token in source_text for token in ["边界", "验收", "目标", "禁止项"]):
         errors.append("quick.md 测试来源未覆盖已确认边界或验收目标")
-    if "Review" not in source_text:
+    if quick_schema_version(text) < 4 and "Review" not in source_text:
         errors.append("quick.md 测试来源未覆盖 Review 结论或验证缺口")
     missing_diff = [
         value
@@ -7760,6 +9368,37 @@ def validate_quick_test_evidence(
     return errors
 
 
+def feature_review_runtime_state(feature_dir: Path) -> tuple[dict, list[str]]:
+    """只读提取 Review disposition；旧状态缺字段时安全解释为 formal。"""
+    state_path = feature_dir / "implementation-state.json"
+    if not state_path.exists():
+        return {}, []
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return {}, [f"implementation-state.json 无法读取: {error}"]
+    review = state.get("review")
+    if not isinstance(review, dict) or not review:
+        return {}, []
+    disposition = str(review.get("disposition", "")).strip()
+    if disposition not in {"light", "formal", "skipped"}:
+        disposition = "formal"
+    result = str(review.get("result", "")).strip()
+    return {
+        "disposition": disposition,
+        "result": result,
+        "gate_satisfied": (
+            result == "passed" and disposition in {"light", "formal"}
+        )
+        or (result == "skipped" and disposition == "skipped"),
+        "passed": result == "passed" and disposition in {"light", "formal"},
+        "implementation_round": str(
+            review.get("implementation_round", state.get("round", ""))
+        ),
+        "fingerprint": str(review.get("fingerprint", "")),
+    }, []
+
+
 def validate_feature_dir(feature_dir: Path) -> list[str]:
     errors: list[str] = []
     meta_path = feature_dir / "meta.json"
@@ -7782,11 +9421,11 @@ def validate_feature_dir(feature_dir: Path) -> list[str]:
     research = feature_dir / "01-research.md"
     design = feature_dir / "02-design.md"
     tasks = feature_dir / "03-tasks.md"
+    sql_draft = feature_dir / "sql-draft.sql"
     schema = feature_dir / "04-schema.sql"
     implementation_log = feature_dir / "05-implementation-log.md"
     code_review_index = feature_dir / "06-code-review.md"
     test_report_index = feature_dir / "07-test-report.md"
-    code_review_rounds = feature_dir / "review-rounds"
     test_report_rounds = feature_dir / "test-rounds"
     interface_details = feature_dir / "interface-details"
     upgraded_from_quick = (feature_dir / "quick.md").exists()
@@ -7806,6 +9445,31 @@ def validate_feature_dir(feature_dir: Path) -> list[str]:
         errors.append(
             f"00-baseline.md 为 schema v{baseline_schema_version}，但 meta.json.workflow_schema_version={schema_version}，两者必须一致"
         )
+    if schema_version >= 5:
+        mode_selection = meta.get("mode_selection", {})
+        expected_mode_selection = {
+            "recommended_mode": extract_line_value(
+                baseline_text,
+                "- 推荐模式：",
+            ).strip(),
+            "recommendation_reason": extract_line_value(
+                baseline_text,
+                "- 推荐依据：",
+            ).strip(),
+            "selected_mode": extract_line_value(
+                baseline_text,
+                "- 最终模式：",
+            ).strip(),
+            "selection_source": extract_line_value(
+                baseline_text,
+                "- 模式选择来源：",
+            ).strip(),
+        }
+        for key, expected in expected_mode_selection.items():
+            if str(mode_selection.get(key, "")).strip() != expected:
+                errors.append(
+                    f"meta.json.mode_selection.{key} 与 00-baseline.md 不一致"
+                )
 
     assert_stage_doc_naming(feature_dir, errors)
 
@@ -7813,6 +9477,7 @@ def validate_feature_dir(feature_dir: Path) -> list[str]:
         assert_not_exists(research, "01-research.md", errors)
         assert_not_exists(design, "02-design.md", errors)
         assert_not_exists(tasks, "03-tasks.md", errors)
+        assert_not_exists(sql_draft, "sql-draft.sql", errors)
         if not upgraded_from_quick:
             assert_not_exists(schema, "04-schema.sql", errors)
             assert_not_exists(interface_details, "interface-details/", errors)
@@ -7826,6 +9491,11 @@ def validate_feature_dir(feature_dir: Path) -> list[str]:
 
     if phase == "技术方案":
         assert_not_exists(tasks, "03-tasks.md", errors)
+
+    if schema_version >= 5 and schema.exists():
+        errors.append(
+            "新版需求使用 sql-draft.sql 承载已确认 SQL；04-schema.sql 仅供历史需求兼容"
+        )
 
     baseline_errors = validate_baseline_doc(baseline, clarification_gate_required=clarification_required)
     errors.extend(baseline_errors)
@@ -7867,11 +9537,27 @@ def validate_feature_dir(feature_dir: Path) -> list[str]:
                 "发现旧版 01-blocking-issues.md；请将仍有效的问题合并到 01-research.md 唯一疑问账本后删除旧文件"
             )
         errors.extend(validate_research_doc(research, repo_root, baseline_text))
+        if schema_version >= 5 and research_schema_version(research_text) != 3:
+            errors.append("新版需求的 01-research.md 必须使用 Research v3")
+        if schema_version >= 5 and (
+            bool(gates.get("sql_confirmed")) or reached("技术方案")
+        ):
+            errors.extend(
+                validate_sql_gate_binding(
+                    feature_dir,
+                    meta,
+                    research_text,
+                    research_claim_ids,
+                )
+            )
 
     if reached("技术方案"):
+        if schema_version >= 5 and design_schema_version(design_text) != 6:
+            errors.append("新版需求的 02-design.md 必须使用 Design v6")
         schema_confirmed = bool(gates.get("schema_confirmed", False))
         waiting_for_schema_confirmation = (
-            phase == "技术方案"
+            schema_version < 5
+            and phase == "技术方案"
             and design_schema_version(design_text) >= 2
             and extract_line_value(design_text, "- 设计状态：") == "SQL待确认"
             and schema.exists()
@@ -7896,8 +9582,16 @@ def validate_feature_dir(feature_dir: Path) -> list[str]:
                 )
             )
 
+        if schema_version >= 5 and design_schema_version(design_text) >= 6:
+            errors.extend(
+                validate_design_sql_gate_binding(
+                    design_text,
+                    research_text,
+                    meta,
+                )
+            )
         mysql_change = extract_line_value(design_text, "- MySQL 结构变更：")
-        if design_schema_version(design_text) >= 2:
+        if schema_version < 5 and design_schema_version(design_text) >= 2:
             if mysql_change == "有" and not schema.exists():
                 errors.append("02-design.md 声明有 MySQL 结构变更，但缺少 04-schema.sql")
             if mysql_change == "无" and schema.exists():
@@ -7906,6 +9600,8 @@ def validate_feature_dir(feature_dir: Path) -> list[str]:
                 errors.append("04-schema.sql 尚未执行 confirm-schema 锁定用户确认，禁止完成技术方案")
 
     if reached("任务拆分"):
+        if schema_version >= 5 and task_schema_version(read_text(tasks)) != 3:
+            errors.append("新版需求的 03-tasks.md 必须使用 Task v3")
         core_change_design_ids = extract_core_change_design_ids_from_design(design_text) if design_text else set()
         errors.extend(
             validate_tasks_doc(
@@ -7915,17 +9611,18 @@ def validate_feature_dir(feature_dir: Path) -> list[str]:
                 research_claim_ids,
                 schema.exists(),
                 core_change_design_ids,
+                sql_draft.exists(),
             )
         )
 
     if reached("编码实现") and not implementation_log.exists():
         errors.append("当前阶段已进入编码实现，缺少 05-implementation-log.md")
-    if reached("代码检查") and not code_review_index.exists():
+    if phase == "代码检查" and not code_review_index.exists():
         errors.append("当前阶段已进入代码检查，缺少 06-code-review.md")
     if reached("测试验证") and not test_report_index.exists():
         errors.append("当前阶段已进入测试验证，缺少 07-test-report.md")
 
-    if schema.exists():
+    if schema.exists() and schema_version < 5:
         errors.extend(validate_schema_doc(schema, meta, research_claim_ids, schema_design_ids))
         schema_confirmation = meta.get("schema_confirmation", {})
         confirmed_schema_fingerprint = str(schema_confirmation.get("confirmed_schema_sha256", "")).strip()
@@ -7939,12 +9636,13 @@ def validate_feature_dir(feature_dir: Path) -> list[str]:
             errors.append("存在 04-schema.sql，但尚未完成用户 SQL 确认，不能进入任务拆分")
 
     errors.extend(validate_implementation_log(implementation_log))
-    errors.extend(validate_code_review_artifacts(code_review_index, code_review_rounds))
+    # Review 是完全可选的独立动作；通用需求校验不把 06 工件当成门禁。
+    # 用户真正执行 Review 时，review-mark 会单独校验两项检查和结论。
     errors.extend(validate_test_report_artifacts(test_report_index, test_report_rounds))
     if reached("代码检查"):
         errors.extend(validate_implementation_completion(implementation_log))
-    if reached("测试验证"):
-        errors.extend(validate_code_review_completion(code_review_index, code_review_rounds))
+    # Code Review 是可选阶段。测试验证只依赖已完成实现与测试工件；
+    # 已存在的 Review 报告作为参考，不形成流程门禁。
     if gates.get("test_passed"):
         errors.extend(validate_test_report_completion(test_report_index, test_report_rounds))
 

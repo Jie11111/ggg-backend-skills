@@ -1,4 +1,4 @@
 interface:
   display_name: "GGG Requirement Alignment"
-  short_description: "需求对齐：验证代码事实与共享状态影响面"
-  default_prompt: "使用 $ggg-requirement-alignment 基于已确认的 00-baseline.md 验证主链路、数据承载、复用边界、共享状态或枚举的生产消费影响面及跨项目依赖。"
+  short_description: "需求对齐：验证代码、共享语义与 SQL，确认后再设计"
+  default_prompt: "使用 $ggg-requirement-alignment 基于已确认基线验证主链路、共享语义、跨项目依赖及新增或修改 SQL，并在用户确认 SQL 后收口。"

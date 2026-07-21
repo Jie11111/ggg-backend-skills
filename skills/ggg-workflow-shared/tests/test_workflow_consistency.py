@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,20 +39,26 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from workflow_contracts import (
     BASELINE_REQUIRED_TOKENS,
-    CODE_REVIEW_INDEX_REQUIRED_TOKENS,
-    CODE_REVIEW_ROUND_REQUIRED_TOKENS,
+    BASELINE_V5_REQUIRED_TOKENS,
+    CODE_REVIEW_SIMPLE_REQUIRED_TOKENS,
     DESIGN_REQUIRED_TOKENS,
     DESIGN_V4_REQUIRED_TOKENS,
     DESIGN_V5_REQUIRED_TOKENS,
+    DESIGN_V6_REQUIRED_TOKENS,
     IMPLEMENTATION_LOG_REQUIRED_TOKENS,
     INTERFACE_DETAIL_REQUIRED_TOKENS,
     INTERFACE_DETAIL_V3_REQUIRED_TOKENS,
+    INTERFACE_DETAIL_V4_REQUIRED_TOKENS,
     QUICK_RECORD_REQUIRED_TOKENS,
+    QUICK_RECORD_V2_REQUIRED_TOKENS,
+    QUICK_RECORD_V4_REQUIRED_TOKENS,
     RESEARCH_REQUIRED_TOKENS,
     RESEARCH_V2_REQUIRED_TOKENS,
+    RESEARCH_V3_REQUIRED_TOKENS,
     TEST_REPORT_INDEX_REQUIRED_TOKENS,
     TEST_REPORT_ROUND_REQUIRED_TOKENS,
     TASK_V2_REQUIRED_TOKENS,
+    TASK_V3_REQUIRED_TOKENS,
 )
 from workflow_validation import (
     extract_quality_paths,
@@ -70,7 +77,7 @@ from workflow_validation import (
     validate_interface_details_dir,
     validate_quick_implementation_completion,
     validate_quick_boundary_ready,
-    validate_quick_review_evidence,
+    validate_optional_review,
     validate_quick_test_evidence,
     validate_research_doc,
     validate_schema_doc,
@@ -95,10 +102,31 @@ from implementation_session import (
 from sync_clarification_impact import ensure_defaults, reopen_baseline_confirmation, reset_from_baseline
 
 
+FULL_INIT_MODE_ARGS = [
+    "--recommended-mode",
+    "full",
+    "--recommendation-reason",
+    "业务链路和数据身份需要完整对齐",
+    "--selection-source",
+    "用户消息 2026-07-20 明确选择 full",
+]
+QUICK_INIT_MODE_ARGS = [
+    "--recommended-mode",
+    "quick",
+    "--recommendation-reason",
+    "目标单一且兼容边界明确",
+    "--selection-source",
+    "用户消息 2026-07-20 明确选择 quick",
+]
+
+
 def build_confirmed_baseline() -> str:
     template = (ASSET_ROOT / "templates" / "baseline-template.md").read_text(encoding="utf-8")
     return (
-        template.replace("- 主项目：", "- 主项目：demo")
+        template.replace("{{recommended_mode}}", "full")
+        .replace("{{recommendation_reason}}", "业务链路和数据身份需要完整对齐")
+        .replace("{{selection_source}}", "用户消息 2026-07-20 明确选择 full")
+        .replace("- 主项目：", "- 主项目：demo")
         .replace("- 主项目判断依据：", "- 主项目判断依据：用户指定 demo 为主项目")
         .replace(
             "| S1 | PRD / 用户消息 / 会议结论 / 原型 / 截图 / 代码证据 |  |  | 形成基线 / 形成疑问 / 明确不适用 |  |",
@@ -231,6 +259,60 @@ def build_research_doc(evidence_location: str, claim_evidence_id: str = "E1") ->
 | 编号 | 项目 | 类型 | 位置 | 结论说明 |
 |---|---|---|---|---|
 | E1 | demo-service | Controller | {evidence_location} | 主入口 |
+"""
+
+
+def build_research_doc_v3(evidence_location: str, claim_evidence_id: str = "E1") -> str:
+    """Build a current Research v3 fixture before the SQL confirmation command."""
+    sql_gate = """
+### 7.1 SQL 影响与确认准备
+
+- SQL 影响类型：不涉及
+- SQL 草案：不涉及：测试场景只验证既有 Java 调用链
+- SQL 确认状态：待确认
+- SQL 确认来源：
+- SQL 语义指纹：
+
+| SQL ID | 类型 | 表/对象 | JOIN/关联 | 过滤/权限条件 | 排序/分页 | 写入字段 | 更新条件/影响行数 | 并发/兼容边界 | 来源Cxx | 证据ID |
+|---|---|---|---|---|---|---|---|---|---|---|
+| SQL1 | 不涉及 | 既有 report_record，无新增或修改 SQL | 不涉及 | 不涉及 | 不涉及 | 不涉及 | 不涉及 | 不涉及 | C1 | E1 |
+
+"""
+    return (
+        build_research_doc(evidence_location, claim_evidence_id)
+        .replace("GGG_RESEARCH_SCHEMA_VERSION: 2", "GGG_RESEARCH_SCHEMA_VERSION: 3")
+        .replace("## 8. 结论账本（Claim Ledger）", sql_gate + "## 8. 结论账本（Claim Ledger）")
+    )
+
+
+def build_research_doc_v3_with_sql(evidence_location: str) -> str:
+    return (
+        build_research_doc_v3(evidence_location)
+        .replace("- SQL 影响类型：不涉及", "- SQL 影响类型：查询或DML")
+        .replace(
+            "- SQL 草案：不涉及：测试场景只验证既有 Java 调用链",
+            "- SQL 草案：`sql-draft.sql`",
+        )
+        .replace(
+            "| SQL1 | 不涉及 | 既有 report_record，无新增或修改 SQL | "
+            "不涉及 | 不涉及 | 不涉及 | 不涉及 | 不涉及 | 不涉及 | C1 | E1 |",
+            "| SQL1 | SELECT | report_record | 不涉及：单表查询 | "
+            "按 report_id 等值过滤并沿用既有权限边界 | 不涉及：单条查询 | "
+            "不涉及：只读 | 不涉及：只读查询 | 并发读取既有记录 | C1 | E1 |",
+        )
+    )
+
+
+def build_sql_draft_v1() -> str:
+    return """-- GGG_SQL_DRAFT_VERSION: 1
+-- SQL影响类型: 查询或DML
+-- 来源Cxx: C1
+-- 说明: 按 report_id 查询既有报告
+
+-- GGG_SQL: {"id":"SQL1","type":"SELECT","objects":["report_record"],"claims":["C1"]}
+SELECT report_id
+FROM report_record
+WHERE report_id = ?;
 """
 
 
@@ -719,6 +801,60 @@ def build_design_doc_v5(
     return text
 
 
+def build_design_doc_v6(source_claim: str = "C1") -> str:
+    """Build a complete current design using the confirmed-SQL reference contract."""
+    text = build_design_doc_v5(
+        source_claim,
+        detail_value="无需：简单内部方法，无独立契约明细",
+        caller="ReportController 返回映射",
+        contract_type="内部方法",
+        identifier="ReportService.mapResponse",
+        input_fields="ReportEntity",
+        trusted_fields="无",
+        forbidden_fields="无",
+        output_fields="ReportResponse",
+        side_effects="无：只转换既有查询结果，不新增读写",
+    )
+    text = text.replace(
+        "<!-- GGG_DESIGN_SCHEMA_VERSION: 5 -->",
+        "<!-- GGG_DESIGN_SCHEMA_VERSION: 6 -->",
+    ).replace(
+        "- MySQL 结构变更：无",
+        "- SQL 影响类型：不涉及\n"
+        "- SQL 确认来源：用户消息 2026-07-21 已确认无 SQL 变化\n"
+        f"- SQL 语义指纹：{'a' * 64}",
+    )
+    old_sql = extract_section(text, "## 五、SQL 变更说明")
+    text = text.replace(
+        old_sql,
+        f"""## 五、已确认 SQL 引用
+
+- SQL Gate：不涉及：本次只调整既有结果映射，不修改查询或写入语义（{source_claim}）
+
+| 设计ID | SQL ID/对象 | SQL 类型 | 业务理由 | 代码落点 | 事务/并发边界 | 兼容/回滚/验证 | 来源Cxx |
+|---|---|---|---|---|---|---|---|
+| D1 | 不涉及：无 SQL 语义变化 | 不涉及 | 只调整返回字段映射 | ReportService.mapResponse | 不改变事务和并发边界 | 回归既有接口响应 | {source_claim} |""",
+        1,
+    )
+    text = text.replace(
+        "- 关键异常处理：业务异常沿现有异常处理器返回。\n"
+        "- 时序图：不需要",
+        "- 异常与失败边界：沿用现有业务异常和统一异常处理器。\n"
+        "- 业务日志：不涉及：纯结果映射不新增业务状态变化日志。\n"
+        "- Trace 链路：不涉及：保持当前同步调用和既有 Trace 上下文。\n"
+        "- 时序图：不需要",
+        1,
+    )
+    interface_index = """## 八、接口设计
+
+| 接口名称 | 新增/修改 | 请求方式 | 路径/方法 | 所属项目 | 接口文档地址 | 备注 |
+|---|---|---|---|---|---|---|
+| 报告结果映射 | 修改 | 内部方法 | ReportService.mapResponse | demo | 无需：简单内部方法，无独立契约明细 | 保持现有返回契约 |
+
+"""
+    return text.replace("## 十三、设计决策记录", interface_index + "## 十三、设计决策记录", 1)
+
+
 def build_interface_detail_v3(
     design_id: str = "D1",
     source_claim: str = "C1",
@@ -1085,6 +1221,24 @@ def build_completed_implementation_log() -> str:
     ).replace(
         "| I | 不涉及（写明本轮没有复杂逻辑的原因） / `文件:行号`＋注释解释的顺序、并发或失败边界 | 不涉及 / `SQL文件`＋参考表或统一兜底＋公共字段/例外＋生产方言与测试 schema 区分 |",
         "| I1 | src/ReportController.java:24，说明重复提交返回既有结果的幂等边界 | 不涉及，本轮没有 SQL/DDL 文件 |",
+    ).replace(
+        "| I | ID / 大整数精度 | 通过 / 有问题 / 不涉及 |  |  |",
+        "| I1 | ID / 大整数精度 | 通过 | src/ReportResponse.java:4，reportId 按 String 序列化 |  |",
+    ).replace(
+        "| I | Request / Response / DTO 字段注释 | 通过 / 有问题 / 不涉及 |  |  |",
+        "| I1 | Request / Response / DTO 字段注释 | 通过 | src/ReportResponse.java:3-6，字段均有业务含义注释 |  |",
+    ).replace(
+        "| I | 异常 / 错误码 | 通过 / 有问题 / 不涉及 |  |  |",
+        "| I1 | 异常 / 错误码 | 通过 | src/ReportController.java:18，沿用 REPORT_NOT_FOUND 错误码 |  |",
+    ).replace(
+        "| I | 业务日志 | 通过 / 有问题 / 不涉及 |  |  |",
+        "| I1 | 业务日志 | 通过 | src/ReportController.java:20，记录 reportId 且不输出敏感内容 |  |",
+    ).replace(
+        "| I | Trace 链路 | 通过 / 有问题 / 不涉及 |  |  |",
+        "| I1 | Trace 链路 | 通过 | src/ReportController.java:16，沿用入口 Trace 上下文 |  |",
+    ).replace(
+        "| I | 测试代码是否修改及用户授权 | 未修改 / 已授权并修改 / 有问题 |  | 用户消息定位 / 不涉及：未修改测试代码 |",
+        "| I1 | 测试代码是否修改及用户授权 | 未修改 | git diff --name-only 未包含测试资产 | 不涉及：本轮未修改任何测试代码 |",
     )
     return text
 
@@ -1092,11 +1246,9 @@ def build_completed_implementation_log() -> str:
 def build_confirmed_quick_template() -> str:
     text = (ASSET_ROOT / "templates" / "quick-record-template.md").read_text(encoding="utf-8")
     return (
-        text.replace(
-            "- 推进模式：quick（自动路由并已告知 / 用户明确指定）",
-            "- 推进模式：quick（自动路由并已告知）",
-        )
-        .replace("- 路由依据：", "- 路由依据：目标单一且兼容边界明确")
+        text.replace("{{recommended_mode}}", "quick")
+        .replace("{{recommendation_reason}}", "目标单一且兼容边界明确")
+        .replace("{{selection_source}}", "用户消息 2026-07-18 明确选择 quick")
         .replace("- 澄清状态：澄清中 / 已确认", "- 澄清状态：已确认")
         .replace(
             "- 最终边界确认：待确认 / 已确认（记录用户消息或确认时间）",
@@ -1129,6 +1281,48 @@ def build_confirmed_quick_template() -> str:
     )
 
 
+def build_legacy_confirmed_quick_v2() -> str:
+    """构造一份独立的 legacy quick v2 夹具，不依赖当前 v4 模板。"""
+    return """<!-- GGG_QUICK_SCHEMA_VERSION: 2 -->
+# Quick 小需求记录：legacy-v2
+
+## 1. 边界确认
+
+- 推进模式：quick（用户明确指定）
+- 路由依据：目标单一且兼容边界明确
+- 澄清状态：已确认
+- 最终边界确认：已确认（用户消息 2026-07-18）
+- 一句话目标：实现报告幂等提交
+- 改什么：调整报告提交服务并保持重复提交幂等
+- 不改什么：不改变其他报告查询链路
+- 预计主项目 / 代码范围：demo；ReportController、ReportService
+- 代表性验收例：已存在 reportId 请求 -> 用户再次提交 -> 服务复用既有记录 -> 返回同一报告结果
+- 失败 / 重复触发补充：重复触发不新增记录，异常沿用现有错误口径
+- 兼容性检查：现有调用方=无影响；历史数据=无影响；重复请求或重试=按既有记录返回
+- 最小验收信号：首次创建且重复提交返回同一记录
+
+| 编号 | 疑问 | 影响级别 | 准确来源 | 为什么不确定 | 用户结论 | 状态 |
+|---|---|---|---|---|---|---|
+| Q1 | 重复提交口径 | 低风险 | 用户消息 2026-07-18 | 需确认幂等结果 | 返回既有记录 | 已确认 |
+
+## 2. 升级 full 触发条件
+
+- 实际改动超过 quick 边界时升级 full。
+
+## 3. 实现摘要
+
+- 实现会话状态文件：`implementation-state.json`
+
+## 4. 验证记录
+
+- 验证结果：未执行
+
+## 5. Review / 测试结论
+
+- Review 对应实现轮次：
+"""
+
+
 def build_completed_quick_record() -> str:
     text = build_confirmed_quick_template()
     text = text.replace(
@@ -1141,36 +1335,26 @@ def build_completed_quick_record() -> str:
         "| quick 边界 | 代码设计 / 契约 / SQL / 权限 / 事务 / 异常日志 / 性能 / 注释 / 格式测试 |  | 通过 / 未通过 |  |",
         "| quick 边界 | 主链路、接口契约、权限、异常日志、注释和格式测试 | src/ReportController.java:10、24；mvn test 通过 | 通过 | 无 |",
     ).replace(
+        "| I | ID / 大整数精度 | 通过 / 有问题 / 不涉及 |  |  |",
+        "| I0 | ID / 大整数精度 | 通过 | src/ReportResponse.java:4，reportId 按 String 序列化 |  |",
+    ).replace(
+        "| I | Request / Response / DTO 字段注释 | 通过 / 有问题 / 不涉及 |  |  |",
+        "| I0 | Request / Response / DTO 字段注释 | 通过 | src/ReportResponse.java:3-6，字段均有业务含义注释 |  |",
+    ).replace(
+        "| I | 异常 / 错误码 | 通过 / 有问题 / 不涉及 |  |  |",
+        "| I0 | 异常 / 错误码 | 通过 | src/ReportController.java:18，沿用 REPORT_NOT_FOUND 错误码 |  |",
+    ).replace(
+        "| I | 业务日志 | 通过 / 有问题 / 不涉及 |  |  |",
+        "| I0 | 业务日志 | 通过 | src/ReportController.java:20，记录 reportId 且不输出敏感内容 |  |",
+    ).replace(
+        "| I | Trace 链路 | 通过 / 有问题 / 不涉及 |  |  |",
+        "| I0 | Trace 链路 | 通过 | src/ReportController.java:16，沿用入口 Trace 上下文 |  |",
+    ).replace(
+        "| I | 测试代码是否修改及用户授权 | 未修改 / 已授权并修改 / 有问题 |  | 用户消息定位 / 不涉及：未修改测试代码 |",
+        "| I0 | 测试代码是否修改及用户授权 | 未修改 | git diff --name-only 未包含测试资产 | 不涉及：本轮未修改任何测试代码 |",
+    ).replace(
         "- 关键逻辑注释证据：不涉及（写明本轮没有复杂逻辑的原因） / `本轮修改文件:行号`＋注释解释的顺序、并发或失败边界",
         "- 关键逻辑注释证据：src/ReportController.java:24，说明重复提交返回既有结果的幂等边界",
-    ).replace(
-        "- Review Gate A：未执行 / 通过 / 需修改 / 阻塞",
-        "- Review Gate A：通过",
-    ).replace(
-        "- Review Gate B：未执行 / 通过 / 需修改 / 阻塞",
-        "- Review Gate B：通过",
-    ).replace(
-        "- Review 未关闭阻塞/必须修问题：",
-        "- Review 未关闭阻塞/必须修问题：无",
-    ).replace(
-        "- Review 剩余风险：",
-        "- Review 剩余风险：无",
-    ).replace(
-        "| A | 目标、禁止项与行为 | 通过 / 有问题 / 阻塞 |  |",
-        "| A | 目标、禁止项与行为 | 通过 | quick 边界与 src/ReportController.java:10-24 一致 |",
-    ).replace(
-        "| A | 契约、数据、权限、兼容与越界 | 通过 / 有问题 / 阻塞 |  |",
-        "| A | 契约、数据、权限、兼容与越界 | 通过 | 独立核对接口边界与权限约束 |",
-    ).replace(
-        "| B | 正确性、安全、失败边界与副作用 | 通过 / 有问题 / 阻塞 |  |",
-        "| B | 正确性、安全、失败边界与副作用 | 通过 | 独立检查幂等与异常边界 |",
-    ).replace(
-        "| B | 可维护性、触发风险与验证充分性 | 通过 / 有问题 / 阻塞 |  |",
-        "| B | 可维护性、触发风险与验证充分性 | 通过 | 复核实现验证记录与真实 diff |",
-    ).replace(
-        "|  | 通过 / 有问题 / 阻塞 | 通过 / 有问题 / 阻塞 |  |",
-        "| src/ReportController.java | 通过 | 通过 | src/ReportController.java:10-24 |"
-        "\n| src/ReportResponse.java | 通过 | 通过 | src/ReportResponse.java:1-8 |",
     ).replace(
         "- 验证命令 / 方式：",
         "- 验证命令 / 方式：mvn test",
@@ -1182,6 +1366,54 @@ def build_completed_quick_record() -> str:
         "- 未验证项：无",
     )
     return text
+
+
+def build_optional_review_quick_record(result: str = "passed") -> str:
+    labels = {
+        "passed": ("通过", "通过", "无", "无"),
+        "needs_changes": (
+            "通过",
+            "有问题",
+            "src/ReportController.java:24 格式与项目约定不一致，影响后续维护",
+            "src/ReportController.java:24 格式与项目约定不一致，需修改",
+        ),
+        "blocked": (
+            "阻塞",
+            "通过",
+            "src/ReportController.java:24 缺少最终需求口径，当前无法判断行为偏差",
+            "缺少最终需求口径，当前无法完成偏差检查",
+        ),
+    }
+    requirement_result, quality_result, problem, unresolved = labels[result]
+    requirement_problem = problem if requirement_result != "通过" else "无"
+    quality_problem = problem if quality_result != "通过" else "无"
+    result_label = {
+        "passed": "通过",
+        "needs_changes": "需修改",
+        "blocked": "阻塞",
+    }[result]
+    return (
+        build_completed_quick_record()
+        .replace("- Review 状态：未执行 / 已执行", "- Review 状态：已执行")
+        .replace(
+            "- Review 结论：未执行 / 通过 / 需修改 / 阻塞",
+            f"- Review 结论：{result_label}",
+        )
+        .replace("- Review 对应实现轮次：", "- Review 对应实现轮次：I1")
+        .replace("- Review 对应差异指纹：", f"- Review 对应差异指纹：{'a' * 64}")
+        .replace(
+            "- Review 未解决问题：无 / 具体问题",
+            f"- Review 未解决问题：{unresolved}",
+        )
+        .replace(
+            "| 代码与需求是否有偏差 | 通过 / 有问题 / 阻塞 | 无 / `文件:行号`＋问题、影响和建议 |",
+            f"| 代码与需求是否有偏差 | {requirement_result} | {requirement_problem} |",
+        )
+        .replace(
+            "| 代码质量与格式 | 通过 / 有问题 / 阻塞 | 无 / `文件:行号`＋问题、影响和建议 |",
+            f"| 代码质量与格式 | {quality_result} | {quality_problem} |",
+        )
+    )
 
 
 def fill_completed_implementation_precheck(path: Path, round_id: str = "I1") -> None:
@@ -1217,6 +1449,45 @@ def fill_completed_implementation_precheck(path: Path, round_id: str = "I1") -> 
             text = text.replace(
                 f"| {placeholder_round} | {item} |  |  | 通过 / 阻塞 |",
                 f"| {round_id} | {item} | {conclusion} | {evidence} | 通过 |",
+                1,
+            )
+    if path.name == "quick.md":
+        evidence_items = [
+            "ID / 大整数精度",
+            "Request / Response / DTO 字段注释",
+            "异常 / 错误码",
+            "业务日志",
+            "Trace 链路",
+            "测试代码是否修改及用户授权",
+        ]
+        source_rows = {
+            item: next(
+                (
+                    line
+                    for line in text.splitlines()
+                    if line.startswith("| I") and f"| {item} |" in line
+                ),
+                "",
+            )
+            for item in evidence_items
+        }
+        missing_rows = [
+            source_rows[item].replace(
+                source_rows[item].split("|", 2)[1].strip(),
+                round_id,
+                1,
+            )
+            for item in evidence_items
+            if source_rows[item]
+            and not any(
+                line.startswith(f"| {round_id} |") and f"| {item} |" in line
+                for line in text.splitlines()
+            )
+        ]
+        if missing_rows:
+            text = text.replace(
+                "- 关键逻辑注释证据：",
+                "\n".join(missing_rows) + "\n\n- 关键逻辑注释证据：",
                 1,
             )
     path.write_text(text, encoding="utf-8")
@@ -1577,21 +1848,37 @@ class WorkflowConsistencyTest(unittest.TestCase):
 
     def test_technical_design_template_matches_contract(self) -> None:
         text = (ASSET_ROOT / "templates" / "technical-design-template.md").read_text(encoding="utf-8")
-        for token in DESIGN_V5_REQUIRED_TOKENS:
+        for token in DESIGN_V6_REQUIRED_TOKENS:
             self.assertIn(token, text)
-        self.assertIn("GGG_DESIGN_SCHEMA_VERSION: 5", text)
+        self.assertIn("GGG_DESIGN_SCHEMA_VERSION: 6", text)
         self.assertNotIn("最小方案与复杂度准入", text)
         self.assertNotIn("SQL 字段风格参考", text)
         self.assertNotIn("旧逻辑与新逻辑差异", text)
-        self.assertIn("字段类型、默认值、索引定义和最终 DDL 只在 `04-schema.sql` 维护", text)
+        self.assertIn("## 五、已确认 SQL 引用", text)
+        self.assertIn("本阶段不首次设计 SQL", text)
+        self.assertIn("## 八、接口设计", text)
 
-    def test_task_v2_template_matches_compact_contract(self) -> None:
+    def test_complete_design_v6_passes_current_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            design = Path(tmp) / "02-design.md"
+            design.write_text(build_design_doc_v6(), encoding="utf-8")
+            errors = validate_design_doc(
+                design,
+                valid_claim_ids={"C1"},
+                eligible_claim_ids={"C1"},
+                transferred_question_ids=set(),
+            )
+        self.assertEqual([], errors)
+
+    def test_task_v3_template_matches_compact_contract(self) -> None:
         text = (ASSET_ROOT / "templates" / "task-breakdown-template.md").read_text(encoding="utf-8")
-        for token in TASK_V2_REQUIRED_TOKENS:
+        for token in TASK_V3_REQUIRED_TOKENS:
             self.assertIn(token, text)
+        self.assertIn("GGG_TASK_SCHEMA_VERSION: 3", text)
         self.assertNotIn("推荐执行顺序", text)
         self.assertNotIn("- 复用范围：", text)
-        self.assertIn("至少两个具体复用方", text)
+        self.assertIn("默认不新增或修改测试类", text)
+        self.assertIn("- 测试代码策略：默认不新增", text)
         summary = extract_section(text, "## 3. 任务总览")
         self.assertIn("| 编号 | 开发任务 | 所属项目 | 依赖任务 |", summary)
         self.assertNotIn("来源依据", summary)
@@ -1599,8 +1886,11 @@ class WorkflowConsistencyTest(unittest.TestCase):
 
     def test_quick_record_template_matches_contract(self) -> None:
         text = (ASSET_ROOT / "templates" / "quick-record-template.md").read_text(encoding="utf-8")
-        for token in QUICK_RECORD_REQUIRED_TOKENS:
+        for token in QUICK_RECORD_V4_REQUIRED_TOKENS:
             self.assertIn(token, text)
+        self.assertIn("GGG_QUICK_SCHEMA_VERSION: 4", text)
+        self.assertIn("### 5.1 可选 Review", text)
+        self.assertNotIn("Review Gate", text)
         self.assertIn("- 代表性验收例：", text)
         self.assertIn("- 兼容性检查：", text)
         self.assertIn("现有调用方", text)
@@ -1609,7 +1899,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
         self.assertIn("### 4.1 代码质量自检", text)
         self.assertIn("### 4.2 运行验证", text)
 
-    def test_quick_v2_boundary_requires_new_contract_fields(self) -> None:
+    def test_quick_v4_boundary_requires_mode_selection_and_contract_fields(self) -> None:
         text = build_confirmed_quick_template()
         text = "\n".join(
             line
@@ -1618,7 +1908,10 @@ class WorkflowConsistencyTest(unittest.TestCase):
                 line.startswith(prefix)
                 for prefix in [
                     "- 推进模式：",
-                    "- 路由依据：",
+                    "- 推荐模式：",
+                    "- 推荐依据：",
+                    "- 最终模式：",
+                    "- 模式选择来源：",
                     "- 代表性验收例：",
                     "- 失败 / 重复触发补充：",
                     "- 兼容性检查：",
@@ -1631,13 +1924,16 @@ class WorkflowConsistencyTest(unittest.TestCase):
             errors = validate_quick_boundary_ready(path)
 
         message = "\n".join(errors)
-        self.assertIn("必须明确推进模式", message)
-        self.assertIn("路由依据缺少实质内容", message)
+        self.assertIn("v4 推进模式必须为 quick", message)
+        self.assertIn("v4 推荐模式必须为 quick 或 full", message)
+        self.assertIn("v4 推荐依据缺少可回查的实质内容", message)
+        self.assertIn("v4 的最终模式必须由用户选择为 quick", message)
+        self.assertIn("v4 模式选择来源缺少可回查的实质内容", message)
         self.assertIn("缺少强制字段：代表性验收例", message)
         self.assertIn("缺少强制字段：失败 / 重复触发补充", message)
         self.assertIn("缺少强制字段：兼容性检查", message)
 
-    def test_quick_v2_boundary_rejects_shallow_example_and_empty_confirmed_question(self) -> None:
+    def test_quick_v4_boundary_rejects_shallow_example_and_empty_confirmed_question(self) -> None:
         text = (
             build_confirmed_quick_template()
             .replace(
@@ -1660,10 +1956,21 @@ class WorkflowConsistencyTest(unittest.TestCase):
         for field in ["疑问", "准确来源", "为什么不确定", "用户结论"]:
             self.assertIn(f"Q1 缺少实质内容: {field}", message)
 
-    def test_quick_v1_boundary_keeps_legacy_compatibility(self) -> None:
+    def test_legacy_quick_v2_boundary_remains_compatible(self) -> None:
+        text = build_legacy_confirmed_quick_v2()
+        for token in QUICK_RECORD_V2_REQUIRED_TOKENS:
+            self.assertIn(token, text)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quick.md"
+            path.write_text(text, encoding="utf-8")
+            errors = validate_quick_boundary_ready(path)
+
+        self.assertEqual([], errors)
+
+    def test_legacy_quick_v1_boundary_keeps_compatibility(self) -> None:
         text = "\n".join(
             line
-            for line in build_confirmed_quick_template().splitlines()
+            for line in build_legacy_confirmed_quick_v2().splitlines()
             if not any(
                 line.startswith(prefix)
                 for prefix in [
@@ -1694,12 +2001,16 @@ class WorkflowConsistencyTest(unittest.TestCase):
 
         self.assertEqual([], errors)
 
-    def test_quick_v2_rejects_invalid_mode_placeholders_and_bare_not_applicable(self) -> None:
+    def test_quick_v4_rejects_invalid_selection_and_bare_not_applicable(self) -> None:
         text = (
             build_confirmed_quick_template()
             .replace(
-                "- 推进模式：quick（自动路由并已告知）",
-                "- 推进模式：quick（自行判断）",
+                "- 最终模式：quick",
+                "- 最终模式：full",
+            )
+            .replace(
+                "- 模式选择来源：用户消息 2026-07-18 明确选择 quick",
+                "- 模式选择来源：用户消息",
             )
             .replace(
                 "- 最终边界确认：已确认（用户消息 2026-07-18）",
@@ -1717,12 +2028,13 @@ class WorkflowConsistencyTest(unittest.TestCase):
             errors = validate_quick_boundary_ready(path)
 
         message = "\n".join(errors)
-        self.assertIn("必须明确推进模式", message)
+        self.assertIn("最终模式必须由用户选择为 quick", message)
+        self.assertIn("模式选择来源缺少可回查的实质内容", message)
         self.assertIn("最终边界确认必须记录用户消息定位或确认时间", message)
         self.assertIn("边界字段仍未收口: - 一句话目标", message)
         self.assertIn("失败 / 重复触发补充必须写明具体口径", message)
 
-    def test_quick_v2_rejects_placeholder_confirmation_and_compatibility_values(self) -> None:
+    def test_quick_v4_rejects_placeholder_confirmation_and_compatibility_values(self) -> None:
         text = (
             build_confirmed_quick_template()
             .replace(
@@ -1743,11 +2055,11 @@ class WorkflowConsistencyTest(unittest.TestCase):
         self.assertIn("最终边界确认必须记录用户消息定位或确认时间", message)
         self.assertIn("兼容性检查缺少已收口项：现有调用方", message)
 
-    def test_quick_v2_rejects_malformed_marker_and_duplicate_or_invalid_questions(self) -> None:
+    def test_quick_v4_rejects_malformed_marker_and_duplicate_or_invalid_questions(self) -> None:
         text = (
             build_confirmed_quick_template()
             .replace(
-                "<!-- GGG_QUICK_SCHEMA_VERSION: 2 -->",
+                "<!-- GGG_QUICK_SCHEMA_VERSION: 4 -->",
                 "<!-- GGG_QUICK_SCHEMA_VERSION: X -->",
             )
             .replace(
@@ -1767,7 +2079,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
         self.assertIn("非法编号: QX", message)
         self.assertIn("疑问编号重复: Q1", message)
 
-    def test_quick_v2_allows_empty_question_ledger_after_removing_example_row(self) -> None:
+    def test_quick_v4_allows_empty_question_ledger_after_removing_example_row(self) -> None:
         text = build_confirmed_quick_template().replace(
             "| Q1 | 重复提交口径 | 低风险 | 用户消息 2026-07-18 | 需确认幂等结果 | 返回既有记录 | 已确认 |\n",
             "",
@@ -2015,7 +2327,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
 
         self.assertEqual([], errors)
 
-    def test_v4_design_and_v2_tasks_advance_to_implementation(self) -> None:
+    def test_legacy_v4_design_and_v2_tasks_advance_to_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp) / "repo"
             repo_root.mkdir()
@@ -2028,13 +2340,27 @@ class WorkflowConsistencyTest(unittest.TestCase):
                     str(repo_root),
                     "--feature-name",
                     "v4-v2闭环",
+                    *FULL_INIT_MODE_ARGS,
                 ],
                 check=True,
                 capture_output=True,
                 text=True,
             )
             feature_dir = next((repo_root / "ggg" / "features").iterdir())
-            (feature_dir / "00-baseline.md").write_text(build_confirmed_baseline(), encoding="utf-8")
+            (feature_dir / "00-baseline.md").write_text(
+                build_confirmed_baseline().replace(
+                    "GGG_SCHEMA_VERSION: 5",
+                    "GGG_SCHEMA_VERSION: 4",
+                ),
+                encoding="utf-8",
+            )
+            legacy_meta_path = feature_dir / "meta.json"
+            legacy_meta = json.loads(legacy_meta_path.read_text(encoding="utf-8"))
+            legacy_meta["workflow_schema_version"] = 4
+            legacy_meta_path.write_text(
+                json.dumps(legacy_meta, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
             subprocess.run(
                 [
                     sys.executable,
@@ -2049,7 +2375,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            subprocess.run(
+            to_alignment = subprocess.run(
                 [
                     sys.executable,
                     str(SCRIPTS_DIR / "workflow_cli.py"),
@@ -2057,10 +2383,11 @@ class WorkflowConsistencyTest(unittest.TestCase):
                     "--feature-dir",
                     str(feature_dir),
                 ],
-                check=True,
+                check=False,
                 capture_output=True,
                 text=True,
             )
+            self.assertEqual(0, to_alignment.returncode, to_alignment.stdout + to_alignment.stderr)
             source = repo_root / "src" / "ReportController.java"
             source.parent.mkdir()
             source.write_text("class ReportController {}\n", encoding="utf-8")
@@ -2068,7 +2395,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
                 build_research_doc("src/ReportController.java:1"),
                 encoding="utf-8",
             )
-            subprocess.run(
+            to_design = subprocess.run(
                 [
                     sys.executable,
                     str(SCRIPTS_DIR / "workflow_cli.py"),
@@ -2076,10 +2403,11 @@ class WorkflowConsistencyTest(unittest.TestCase):
                     "--feature-dir",
                     str(feature_dir),
                 ],
-                check=True,
+                check=False,
                 capture_output=True,
                 text=True,
             )
+            self.assertEqual(0, to_design.returncode, to_design.stdout + to_design.stderr)
             (feature_dir / "02-design.md").write_text(
                 build_design_doc_v4(include_non_mysql_detail=False),
                 encoding="utf-8",
@@ -2517,32 +2845,29 @@ class WorkflowConsistencyTest(unittest.TestCase):
         self.assertIn("已经确认且代码事实一致的内容直接实施，不重复询问", standard)
         self.assertIn("实现偏离已确认内容", standard)
 
-    def test_coding_workflow_requires_risk_driven_tests_or_explicit_waiver(self) -> None:
+    def test_coding_workflow_defaults_to_no_test_code_without_user_authorization(self) -> None:
         implementation = (SKILLS_ROOT / "ggg-implementation" / "SKILL.md").read_text(encoding="utf-8")
         standard = (SKILLS_ROOT / "ggg-java-coding-standard" / "SKILL.md").read_text(encoding="utf-8")
         review = (SKILLS_ROOT / "ggg-code-review" / "SKILL.md").read_text(encoding="utf-8")
-        review_checklist = (
-            SKILLS_ROOT / "ggg-code-review" / "references" / "code-review-quality-checklist.md"
-        ).read_text(encoding="utf-8")
 
-        self.assertIn("应新增/更新最接近的自动化测试", implementation)
-        self.assertIn("“用户未要求写测试”不是关键覆盖缺口的豁免理由", implementation)
-        self.assertIn("无法合理自动化时允许显式豁免", standard)
-        self.assertIn("高风险行为缺少自动化测试或明确豁免依据时属于验证缺口", review)
-        self.assertIn("需要自动化测试，或记录可审计的豁免理由", review_checklist)
+        self.assertIn("默认不创建或修改测试类", implementation)
+        self.assertIn("只有用户明确要求测试代码时才实施", implementation)
+        self.assertIn("默认不创建测试类", standard)
+        self.assertIn("只有用户明确要求测试代码时", standard)
+        self.assertIn("默认不要求新增测试类", review)
+        self.assertFalse(
+            (SKILLS_ROOT / "ggg-code-review" / "references" / "code-review-quality-checklist.md").exists()
+        )
 
     def test_java_standard_is_single_source_for_coding_quality_rules(self) -> None:
         implementation = (SKILLS_ROOT / "ggg-implementation" / "SKILL.md").read_text(encoding="utf-8")
         standard = (SKILLS_ROOT / "ggg-java-coding-standard" / "SKILL.md").read_text(encoding="utf-8")
         review = (SKILLS_ROOT / "ggg-code-review" / "SKILL.md").read_text(encoding="utf-8")
-        review_checklist = (
-            SKILLS_ROOT / "ggg-code-review" / "references" / "code-review-quality-checklist.md"
-        ).read_text(encoding="utf-8")
 
         self.assertIn("把本文件作为 GGG 唯一的 Java 后端代码规范", standard)
         self.assertIn("不重新解释业务，也不复制语言规范", implementation)
         self.assertIn("ggg-java-coding-standard", review)
-        self.assertIn("不要重复编码规范", review_checklist)
+        self.assertIn("只应用与本次 diff 直接相关的规则", review)
         self.assertNotIn("fencing token", implementation)
         self.assertNotIn("fencing", review)
 
@@ -2638,6 +2963,62 @@ class WorkflowConsistencyTest(unittest.TestCase):
             errors = validate_implementation_completion(path)
         self.assertEqual([], errors)
 
+    def test_full_implementation_gate_rejects_unresolved_contract_or_observability_evidence(self) -> None:
+        checks = [
+            "ID / 大整数精度",
+            "Request / Response / DTO 字段注释",
+            "异常 / 错误码",
+            "业务日志",
+            "Trace 链路",
+        ]
+        for item in checks:
+            with self.subTest(item=item), tempfile.TemporaryDirectory() as tmp:
+                text = build_completed_implementation_log().replace(
+                    f"| I1 | {item} | 通过 |",
+                    f"| I1 | {item} | 有问题 |",
+                )
+                path = Path(tmp) / "05-implementation-log.md"
+                path.write_text(text, encoding="utf-8")
+                errors = validate_implementation_completion(path)
+                self.assertIn(f"“{item}”仍有问题", "\n".join(errors))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            text = build_completed_implementation_log().replace(
+                "| I1 | 测试代码是否修改及用户授权 | 未修改 |",
+                "| I1 | 测试代码是否修改及用户授权 | 有问题 |",
+            )
+            path = Path(tmp) / "05-implementation-log.md"
+            path.write_text(text, encoding="utf-8")
+            errors = validate_implementation_completion(path)
+            self.assertIn(
+                "“测试代码是否修改及用户授权”仍有问题",
+                "\n".join(errors),
+            )
+
+    def test_full_implementation_gate_binds_test_authorization_to_actual_diff(self) -> None:
+        undeclared_test_change = build_completed_implementation_log().replace(
+            "src/ReportController.java<br>src/ReportResponse.java",
+            "src/ReportController.java<br>src/ReportResponse.java"
+            "<br>src/test/java/demo/ReportServiceTest.java",
+        )
+        authorized_without_test_change = build_completed_implementation_log().replace(
+            "| I1 | 测试代码是否修改及用户授权 | 未修改 | "
+            "git diff --name-only 未包含测试资产 | "
+            "不涉及：本轮未修改任何测试代码 |",
+            "| I1 | 测试代码是否修改及用户授权 | 已授权并修改 | "
+            "git diff --name-only 已人工核对 | "
+            "用户消息:2026-07-21 明确授权本轮修改测试代码 |",
+        )
+        cases = [
+            (undeclared_test_change, "声明未修改测试代码，但当前差异包含测试资产"),
+            (authorized_without_test_change, "声明已授权并修改测试代码，但当前差异未发现测试资产"),
+        ]
+        for text, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "05-implementation-log.md"
+                path.write_text(text, encoding="utf-8")
+                self.assertIn(expected, "\n".join(validate_implementation_completion(path)))
+
     def test_full_implementation_gate_rejects_comment_evidence_from_other_file(self) -> None:
         text = build_completed_implementation_log().replace(
             "src/ReportController.java:24，说明重复提交返回既有结果的幂等边界",
@@ -2705,6 +3086,44 @@ class WorkflowConsistencyTest(unittest.TestCase):
             path.write_text(build_completed_quick_record(), encoding="utf-8")
             errors = validate_quick_implementation_completion(path)
         self.assertEqual([], errors)
+
+    def test_quick_implementation_gate_rejects_unresolved_contract_evidence(self) -> None:
+        text = build_completed_quick_record().replace(
+            "| I0 | Trace 链路 | 通过 |",
+            "| I0 | Trace 链路 | 有问题 |",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quick.md"
+            path.write_text(text, encoding="utf-8")
+            errors = validate_quick_implementation_completion(path)
+        self.assertIn("“Trace 链路”仍有问题", "\n".join(errors))
+
+    def test_quick_implementation_gate_binds_test_authorization_to_actual_diff(self) -> None:
+        undeclared_test_change = build_completed_quick_record().replace(
+            "- 修改文件：src/ReportController.java、src/ReportResponse.java",
+            "- 修改文件：src/ReportController.java、src/ReportResponse.java、"
+            "src/test/java/demo/ReportServiceTest.java",
+        )
+        authorized_without_test_change = build_completed_quick_record().replace(
+            "| I0 | 测试代码是否修改及用户授权 | 未修改 | "
+            "git diff --name-only 未包含测试资产 | "
+            "不涉及：本轮未修改任何测试代码 |",
+            "| I0 | 测试代码是否修改及用户授权 | 已授权并修改 | "
+            "git diff --name-only 已人工核对 | "
+            "用户消息:2026-07-21 明确授权本轮修改测试代码 |",
+        )
+        cases = [
+            (undeclared_test_change, "声明未修改测试代码，但当前差异包含测试资产"),
+            (authorized_without_test_change, "声明已授权并修改测试代码，但当前差异未发现测试资产"),
+        ]
+        for text, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "quick.md"
+                path.write_text(text, encoding="utf-8")
+                self.assertIn(
+                    expected,
+                    "\n".join(validate_quick_implementation_completion(path)),
+                )
 
     def test_quick_implementation_gate_rejects_failed_validation(self) -> None:
         text = build_completed_quick_record().replace("- 验证结果：通过", "- 验证结果：失败")
@@ -2801,52 +3220,37 @@ class WorkflowConsistencyTest(unittest.TestCase):
             errors = validate_quick_implementation_completion(path)
         self.assertIn("DDL 改动缺少 SQL/DDL 规范证据", "\n".join(errors))
 
-    def test_quick_review_requires_independent_gate_a_evidence(self) -> None:
-        text = build_completed_quick_record().replace(
-            "| A | 目标、禁止项与行为 | 通过 | quick 边界与 src/ReportController.java:10-24 一致 |",
-            "| A | 目标、禁止项与行为 | 通过 |  |",
-        )
+    def test_quick_optional_review_passed_requires_exactly_two_passed_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "quick.md"
-            path.write_text(text, encoding="utf-8")
-            errors = validate_quick_review_evidence(path, {"src/ReportController.java"})
-        self.assertIn("目标、禁止项与行为”缺少独立证据", "\n".join(errors))
+            path.write_text(build_optional_review_quick_record("passed"), encoding="utf-8")
+            errors = validate_optional_review(path, "passed", "I1", "a" * 64)
+        self.assertEqual([], errors)
 
-    def test_quick_review_rejects_failed_gate_b_check(self) -> None:
-        text = build_completed_quick_record().replace(
-            "| B | 正确性、安全、失败边界与副作用 | 通过 | 独立检查幂等与异常边界 |",
-            "| B | 正确性、安全、失败边界与副作用 | 有问题 | CR1：缺少幂等保护 |",
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "quick.md"
-            path.write_text(text, encoding="utf-8")
-            errors = validate_quick_review_evidence(path, {"src/ReportController.java"})
-        self.assertIn("正确性、安全、失败边界与副作用”必须明确为通过", "\n".join(errors))
-
-    def test_quick_review_rejects_diff_coverage_from_other_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "quick.md"
-            path.write_text(build_completed_quick_record(), encoding="utf-8")
-            errors = validate_quick_review_evidence(path, {"src/NewService.java"})
-        error_text = "\n".join(errors)
-        self.assertIn("未覆盖本轮实际文件: src/NewService.java", error_text)
-        self.assertIn("覆盖了非本轮文件", error_text)
-
-    def test_quick_review_requires_all_actual_files_and_two_gates(self) -> None:
-        text = build_completed_quick_record().replace(
-            "| src/ReportResponse.java | 通过 | 通过 | src/ReportResponse.java:1-8 |",
+    def test_quick_optional_review_rejects_missing_required_row(self) -> None:
+        text = build_optional_review_quick_record("passed").replace(
+            "| 代码质量与格式 | 通过 | 无 |\n",
             "",
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "quick.md"
             path.write_text(text, encoding="utf-8")
-            errors = validate_quick_review_evidence(
-                path,
-                {"src/ReportController.java", "src/ReportResponse.java"},
-            )
-        error_text = "\n".join(errors)
-        self.assertIn("未覆盖本轮实际文件: src/ReportResponse.java", error_text)
-        self.assertNotIn("幻觉审计", error_text)
+            errors = validate_optional_review(path, "passed", "I1", "a" * 64)
+        self.assertIn("必须且只能有一条“代码质量与格式”", "\n".join(errors))
+
+    def test_quick_optional_review_accepts_needs_changes_with_problem_location(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quick.md"
+            path.write_text(build_optional_review_quick_record("needs_changes"), encoding="utf-8")
+            errors = validate_optional_review(path, "needs_changes", "I1", "a" * 64)
+        self.assertEqual([], errors)
+
+    def test_quick_optional_review_accepts_blocked_with_problem_location(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quick.md"
+            path.write_text(build_optional_review_quick_record("blocked"), encoding="utf-8")
+            errors = validate_optional_review(path, "blocked", "I1", "a" * 64)
+        self.assertEqual([], errors)
 
     def test_quality_gate_cli_accepts_complete_quick_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3429,7 +3833,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
             )
             self.assertEqual(0, restarted.returncode, restarted.stdout + restarted.stderr)
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(7, state["schema_version"])
+            self.assertEqual(11, state["schema_version"])
             self.assertEqual("I2", state["round"])
             self.assertEqual(
                 quick_boundary_fingerprint(record),
@@ -3440,7 +3844,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
                 if line.startswith("| I2 |")
             ))
 
-    def test_implementation_session_locks_diff_and_invalidates_review_after_change(self) -> None:
+    def test_implementation_session_locks_diff_and_marks_optional_review_stale_after_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "demo"
@@ -3489,8 +3893,18 @@ class WorkflowConsistencyTest(unittest.TestCase):
 
             review_text = (
                 record.read_text(encoding="utf-8")
-                .replace("- Review Gate A：未执行", "- Review Gate A：通过")
-                .replace("- Review Gate B：未执行", "- Review Gate B：通过")
+                .replace(
+                    "| 代码与需求是否有偏差 | 通过 / 有问题 / 阻塞 | 无 / `文件:行号`＋问题、影响和建议 |",
+                    "| 代码与需求是否有偏差 | 通过 | 无 |",
+                )
+                .replace(
+                    "| 代码质量与格式 | 通过 / 有问题 / 阻塞 | 无 / `文件:行号`＋问题、影响和建议 |",
+                    "| 代码质量与格式 | 通过 | 无 |",
+                )
+                .replace(
+                    "- Review 未解决问题：无 / 具体问题",
+                    "- Review 未解决问题：无",
+                )
             )
             record.write_text(review_text, encoding="utf-8")
             review = subprocess.run(
@@ -3502,8 +3916,6 @@ class WorkflowConsistencyTest(unittest.TestCase):
                     str(record),
                     "--result",
                     "passed",
-                    "--reviewer-mode",
-                    "fresh-review",
                 ],
                 check=False,
                 capture_output=True,
@@ -3511,8 +3923,11 @@ class WorkflowConsistencyTest(unittest.TestCase):
             )
             self.assertEqual(0, review.returncode, review.stdout + review.stderr)
             state = json.loads((root / "implementation-state.json").read_text(encoding="utf-8"))
-            self.assertEqual("fresh-review", state["review"]["reviewer_mode"])
-            self.assertIn("- Review 方式：fresh-review", record.read_text(encoding="utf-8"))
+            self.assertEqual("optional", state["review"]["model"])
+            self.assertEqual("passed", state["review"]["result"])
+            self.assertNotIn("disposition", state["review"])
+            self.assertIn("- Review 状态：已执行", record.read_text(encoding="utf-8"))
+            self.assertIn("- Review 结论：通过", record.read_text(encoding="utf-8"))
 
             (repo / "src" / "ReportController.java").write_text("class ReportController { int changed; }\n", encoding="utf-8")
             stale = subprocess.run(
@@ -3525,7 +3940,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
             self.assertIn("[STALE]", stale.stdout)
 
             review_stale = subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "workflow_cli.py"), "review-status", "--record", str(record), "--require-passed"],
+                [sys.executable, str(SCRIPTS_DIR / "workflow_cli.py"), "review-status", "--record", str(record)],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -4106,7 +4521,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
 
     def test_baseline_template_matches_contract(self) -> None:
         text = (ASSET_ROOT / "templates" / "baseline-template.md").read_text(encoding="utf-8")
-        for token in BASELINE_REQUIRED_TOKENS:
+        for token in BASELINE_V5_REQUIRED_TOKENS:
             self.assertIn(token, text)
 
     def test_prd_intake_questions_recommend_without_silent_guessing(self) -> None:
@@ -4129,8 +4544,9 @@ class WorkflowConsistencyTest(unittest.TestCase):
     def test_prd_intake_avoids_redundant_mode_and_local_baseline_confirmation(self) -> None:
         skill = skill_path("ggg-prd-intake", "SKILL.md").read_text(encoding="utf-8")
 
-        self.assertIn("自动路由 quick / full 并告知", skill)
-        self.assertIn("路由清楚时直接继续，不等待用户重复确认", skill)
+        self.assertIn("先判断并推荐 `quick/full`，由用户作最终选择", skill)
+        self.assertIn("用户明确指定 quick/full 时直接采用并记录来源", skill)
+        self.assertIn("用户未选择且未授权 AI 决定时，不初始化目录", skill)
         self.assertIn("同模块低风险独立问题可以一轮合并 2-3 个", skill)
         self.assertIn("局部明确修正", skill)
         self.assertIn("不重复完整主链路复述", skill)
@@ -4231,7 +4647,6 @@ class WorkflowConsistencyTest(unittest.TestCase):
             "design_confirmed": True,
             "tasks_confirmed": True,
             "implementation_completed": True,
-            "review_passed": True,
             "test_passed": True,
             "release_ready": True,
         }
@@ -4252,7 +4667,6 @@ class WorkflowConsistencyTest(unittest.TestCase):
             "design_confirmed",
             "tasks_confirmed",
             "implementation_completed",
-            "review_passed",
             "test_passed",
             "release_ready",
             "business_model_confirmed",
@@ -4271,7 +4685,6 @@ class WorkflowConsistencyTest(unittest.TestCase):
                 "design_confirmed": True,
                 "tasks_confirmed": True,
                 "implementation_completed": True,
-                "review_passed": True,
                 "test_passed": True,
                 "release_ready": True,
                 "business_model_confirmed": True,
@@ -4390,6 +4803,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
                     str(repo_root),
                     "--feature-name",
                     "未确认需求",
+                    *FULL_INIT_MODE_ARGS,
                     "--date",
                     "20260713",
                 ],
@@ -4430,6 +4844,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
                     str(repo_root),
                     "--feature-name",
                     "已确认需求",
+                    *FULL_INIT_MODE_ARGS,
                     "--date",
                     "20260713",
                 ],
@@ -4474,12 +4889,163 @@ class WorkflowConsistencyTest(unittest.TestCase):
         self.assertIn("问题类型", research)
         self.assertFalse((feature_dir / "01-blocking-issues.md").exists())
 
-    def test_schema_v3_baseline_cannot_use_downgraded_meta_version(self) -> None:
+    def test_sql_gate_blocks_before_confirmation_allows_after_and_rejects_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp) / "repo"
             repo_root.mkdir()
             subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "workflow_cli.py"), "init", "--repo-root", str(repo_root), "--feature-name", "schema一致性"],
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "workflow_cli.py"),
+                    "init",
+                    "--repo-root",
+                    str(repo_root),
+                    "--feature-name",
+                    "sql-gate闭环",
+                    *FULL_INIT_MODE_ARGS,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            feature_dir = next((repo_root / "ggg" / "features").iterdir())
+            (feature_dir / "00-baseline.md").write_text(
+                build_confirmed_baseline(),
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "workflow_cli.py"),
+                    "confirm-baseline",
+                    "--feature-dir",
+                    str(feature_dir),
+                    "--source",
+                    "用户消息:2026-07-21 13:00 已确认需求基线",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "workflow_cli.py"),
+                    "to-alignment",
+                    "--feature-dir",
+                    str(feature_dir),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            source = repo_root / "src" / "ReportController.java"
+            source.parent.mkdir()
+            source.write_text("class ReportController {}\n", encoding="utf-8")
+            (feature_dir / "01-research.md").write_text(
+                build_research_doc_v3_with_sql("src/ReportController.java:1"),
+                encoding="utf-8",
+            )
+            (feature_dir / "sql-draft.sql").write_text(
+                build_sql_draft_v1(),
+                encoding="utf-8",
+            )
+
+            before_confirmation = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "workflow_cli.py"),
+                    "to-design",
+                    "--feature-dir",
+                    str(feature_dir),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(0, before_confirmation.returncode)
+            self.assertIn(
+                "SQL Gate 尚未完成",
+                before_confirmation.stdout + before_confirmation.stderr,
+            )
+
+            confirmed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "workflow_cli.py"),
+                    "confirm-sql",
+                    "--feature-dir",
+                    str(feature_dir),
+                    "--source",
+                    "用户消息:2026-07-21 13:05 已确认 SQL1",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, confirmed.returncode, confirmed.stdout + confirmed.stderr)
+
+            allowed_feature = feature_dir.parent / f"{feature_dir.name}-allowed"
+            shutil.copytree(feature_dir, allowed_feature)
+            after_confirmation = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "workflow_cli.py"),
+                    "to-design",
+                    "--feature-dir",
+                    str(allowed_feature),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                0,
+                after_confirmation.returncode,
+                after_confirmation.stdout + after_confirmation.stderr,
+            )
+
+            draft = feature_dir / "sql-draft.sql"
+            draft.write_text(
+                draft.read_text(encoding="utf-8").replace(
+                    "SELECT report_id",
+                    "SELECT id, report_id",
+                ),
+                encoding="utf-8",
+            )
+            after_drift = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "workflow_cli.py"),
+                    "to-design",
+                    "--feature-dir",
+                    str(feature_dir),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(0, after_drift.returncode)
+            self.assertIn(
+                "sql-draft.sql 语义在用户确认后发生变化",
+                after_drift.stdout + after_drift.stderr,
+            )
+
+    def test_schema_v5_baseline_cannot_use_downgraded_meta_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "workflow_cli.py"),
+                    "init",
+                    "--repo-root",
+                    str(repo_root),
+                    "--feature-name",
+                    "schema一致性",
+                    *FULL_INIT_MODE_ARGS,
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -4509,9 +5075,9 @@ class WorkflowConsistencyTest(unittest.TestCase):
 
     def test_requirement_research_template_matches_contract(self) -> None:
         text = (ASSET_ROOT / "templates" / "requirement-research-template.md").read_text(encoding="utf-8")
-        for token in RESEARCH_V2_REQUIRED_TOKENS:
+        for token in RESEARCH_V3_REQUIRED_TOKENS:
             self.assertIn(token, text)
-        self.assertIn("GGG_RESEARCH_SCHEMA_VERSION: 2", text)
+        self.assertIn("GGG_RESEARCH_SCHEMA_VERSION: 3", text)
         self.assertNotIn("## 8. 代码证据覆盖度", text)
         self.assertIn("唯一的疑问和阻塞问题账本", text)
 
@@ -4662,6 +5228,7 @@ class WorkflowConsistencyTest(unittest.TestCase):
                     str(repo_root),
                     "--feature-name",
                     "单一疑问账本",
+                    *FULL_INIT_MODE_ARGS,
                     "--date",
                     "20260716",
                 ],
@@ -4701,8 +5268,21 @@ class WorkflowConsistencyTest(unittest.TestCase):
             source.parent.mkdir()
             source.write_text("class ReportController {}\n", encoding="utf-8")
             (feature_dir / "01-research.md").write_text(
-                build_research_doc("src/ReportController.java:1"),
+                build_research_doc_v3("src/ReportController.java:1"),
                 encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "confirm_sql.py"),
+                    "--feature-dir",
+                    str(feature_dir),
+                    "--source",
+                    "用户消息:2026-07-21 已确认无 SQL 变更",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
             )
             stale_meta = json.loads((feature_dir / "meta.json").read_text(encoding="utf-8"))
             stale_meta["blocking_issue_count"] = 99
@@ -5636,7 +6216,16 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
             repo_root = Path(tmp) / "repo"
             repo_root.mkdir()
             subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "workflow_cli.py"), "init", "--repo-root", str(repo_root), "--feature-name", "阻塞门禁"],
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "workflow_cli.py"),
+                    "init",
+                    "--repo-root",
+                    str(repo_root),
+                    "--feature-name",
+                    "阻塞门禁",
+                    *FULL_INIT_MODE_ARGS,
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -5968,7 +6557,8 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
         self.assertTrue(gates["design_confirmed"])
         self.assertFalse(gates["tasks_confirmed"])
         self.assertFalse(gates["implementation_completed"])
-        self.assertFalse(gates["review_passed"])
+        self.assertNotIn("review_passed", gates)
+        self.assertNotIn("review_gate_satisfied", gates)
         self.assertFalse(gates["test_passed"])
         self.assertFalse(gates["release_ready"])
         self.assertFalse(gates["clarification_required"])
@@ -5989,8 +6579,7 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
     def test_execution_templates_match_contract(self) -> None:
         template_checks = [
             ("implementation-log-template.md", IMPLEMENTATION_LOG_REQUIRED_TOKENS),
-            ("code-review-index-template.md", CODE_REVIEW_INDEX_REQUIRED_TOKENS),
-            ("code-review-round-template.md", CODE_REVIEW_ROUND_REQUIRED_TOKENS),
+            ("code-review-index-template.md", CODE_REVIEW_SIMPLE_REQUIRED_TOKENS),
             ("test-report-index-template.md", TEST_REPORT_INDEX_REQUIRED_TOKENS),
             ("test-report-round-template.md", TEST_REPORT_ROUND_REQUIRED_TOKENS),
         ]
@@ -5998,12 +6587,13 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
             text = (ASSET_ROOT / "templates" / template_name).read_text(encoding="utf-8")
             for token in tokens:
                 self.assertIn(token, text)
+        self.assertFalse((ASSET_ROOT / "templates" / "code-review-round-template.md").exists())
 
     def test_interface_detail_template_matches_contract(self) -> None:
         text = (ASSET_ROOT / "templates" / "interface-detail-template.md").read_text(encoding="utf-8")
-        for token in INTERFACE_DETAIL_V3_REQUIRED_TOKENS:
+        for token in INTERFACE_DETAIL_V4_REQUIRED_TOKENS:
             self.assertIn(token, text)
-        self.assertIn("GGG_INTERFACE_SCHEMA_VERSION: 3", text)
+        self.assertIn("GGG_INTERFACE_SCHEMA_VERSION: 4", text)
 
     def test_init_keeps_existing_workflow_assets_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6016,7 +6606,15 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
             baseline_template_path.write_text("custom baseline template\n", encoding="utf-8")
 
             subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "init_feature_docs.py"), "--repo-root", str(repo_root), "--feature-name", "示例需求"],
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "init_feature_docs.py"),
+                    "--repo-root",
+                    str(repo_root),
+                    "--feature-name",
+                    "示例需求",
+                    *FULL_INIT_MODE_ARGS,
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -6026,11 +6624,11 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
             self.assertEqual(baseline_template_path.read_text(encoding="utf-8"), "custom baseline template\n")
             meta_path = next((repo_root / "ggg" / "features").glob("*/meta.json"))
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            self.assertEqual(4, meta["workflow_schema_version"])
+            self.assertEqual(5, meta["workflow_schema_version"])
             self.assertTrue(meta["gates"]["clarification_required"])
             self.assertFalse(meta["gates"]["clarification_confirmed"])
             feature_baseline = meta_path.parent / "00-baseline.md"
-            self.assertIn("GGG_SCHEMA_VERSION: 4", feature_baseline.read_text(encoding="utf-8"))
+            self.assertIn("GGG_SCHEMA_VERSION: 5", feature_baseline.read_text(encoding="utf-8"))
 
     def test_init_quick_record_creates_lightweight_record_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6046,6 +6644,7 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
                     str(repo_root),
                     "--quick-name",
                     "示例小需求",
+                    *QUICK_INIT_MODE_ARGS,
                     "--date",
                     "20260703",
                     "--create-schema",
@@ -6061,7 +6660,9 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
             self.assertTrue(quick_path.exists())
             quick_text = quick_path.read_text(encoding="utf-8")
             self.assertIn("Quick 小需求记录：示例小需求", quick_text)
-            self.assertIn("<!-- GGG_QUICK_SCHEMA_VERSION: 2 -->", quick_text)
+            self.assertIn("<!-- GGG_QUICK_SCHEMA_VERSION: 4 -->", quick_text)
+            self.assertIn("- 推荐模式：quick", quick_text)
+            self.assertIn("- 模式选择来源：用户消息 2026-07-20 明确选择 quick", quick_text)
             self.assertFalse((quick_path.parent / "meta.json").exists())
             self.assertTrue((quick_path.parent / "04-schema.sql").exists())
             interface_paths = list((quick_path.parent / "interface-details").glob("02-interface-*-查询学习包.md"))
@@ -6077,6 +6678,7 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
                     str(repo_root),
                     "--quick-name",
                     "示例小需求",
+                    *QUICK_INIT_MODE_ARGS,
                     "--date",
                     "20260703",
                     "--interface-name",
@@ -6099,6 +6701,7 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
                     str(repo_root),
                     "--feature-name",
                     "示例小需求",
+                    *FULL_INIT_MODE_ARGS,
                     "--date",
                     "20260703",
                 ],
@@ -6128,6 +6731,7 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
                     "init-quick",
                     "--quick-name",
                     "默认根目录小需求",
+                    *QUICK_INIT_MODE_ARGS,
                     "--date",
                     "20260704",
                 ],
@@ -6143,6 +6747,7 @@ ALTER TABLE `report_record` MODIFY COLUMN `report_id` bigint NOT NULL;
                     "init",
                     "--feature-name",
                     "默认根目录正式需求",
+                    *FULL_INIT_MODE_ARGS,
                     "--date",
                     "20260705",
                 ],

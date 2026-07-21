@@ -1,4 +1,4 @@
 interface:
   display_name: "GGG Code Review"
-  short_description: "优先 fresh context，分两门检查完整差异并披露评审方式"
-  default_prompt: "使用 $ggg-code-review 优先通过 fresh-context 评审当前完整差异，不可用时显式降级 self-review，再完成 Gate A、Gate B 和结论绑定。"
+  short_description: "可选检查需求偏差、代码质量与项目格式"
+  default_prompt: "使用 $ggg-code-review 检查本次代码是否偏离需求，以及代码质量和格式是否合格。"

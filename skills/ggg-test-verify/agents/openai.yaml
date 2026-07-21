@@ -1,4 +1,4 @@
 interface:
   display_name: "GGG Test Verify"
-  short_description: "按验收来源与风险执行可复跑测试，并绑定可核验的真实证据"
-  default_prompt: "使用 $ggg-test-verify 选择正式门禁、局部运行或失败定位模式，从验收来源和真实差异推导场景，执行并绑定可复查证据。"
+  short_description: "基于需求和真实差异执行非 PTY 可复跑验证"
+  default_prompt: "使用 $ggg-test-verify 从验收来源和真实差异推导场景，并以一次性非 PTY 命令执行和绑定证据；没有 Review 也可直接验证。"

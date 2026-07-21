@@ -67,16 +67,36 @@ def main() -> None:
           f"design={gate_label(gates.get('design_confirmed', False))} | "
           f"tasks={gate_label(gates.get('tasks_confirmed', False))} | "
           f"implementation={gate_label(gates.get('implementation_completed', False))} | "
-          f"review={gate_label(gates.get('review_passed', False))} | "
           f"test={gate_label(gates.get('test_passed', False))} | "
           f"business_model={gate_label(gates.get('business_model_confirmed', False))} | "
           f"upstream_contract={gate_label(gates.get('upstream_contract_confirmed', False))}")
-    print(f"[SQL确认] {gate_label(gates.get('schema_confirmed', False))} | "
-          f"来源={meta.get('schema_confirmation', {}).get('confirmation_source', '') or '无'} | "
-          f"时间={meta.get('schema_confirmation', {}).get('confirmed_at', '') or '无'}")
+    if int(meta.get("workflow_schema_version", 1)) >= 5:
+        sql_confirmation = meta.get("sql_confirmation", {})
+        print(
+            f"[SQL Gate] {gate_label(gates.get('sql_confirmed', False))} | "
+            f"类型={sql_confirmation.get('impact_type', '') or '未登记'} | "
+            f"来源={sql_confirmation.get('confirmation_source', '') or '无'} | "
+            f"时间={sql_confirmation.get('confirmed_at', '') or '无'}"
+        )
+    else:
+        print(f"[SQL确认] {gate_label(gates.get('schema_confirmed', False))} | "
+              f"来源={meta.get('schema_confirmation', {}).get('confirmation_source', '') or '无'} | "
+              f"时间={meta.get('schema_confirmation', {}).get('confirmed_at', '') or '无'}")
+    review_status = str(meta.get("review_status", "not_run"))
+    review_label = {
+        "not_run": "未执行",
+        "in_progress": "检查中",
+        "passed": "通过",
+        "needs_changes": "需修改",
+        "blocked": "阻塞",
+        "stale": "仅历史参考",
+        "skipped": "未执行",
+    }.get(review_status, review_status)
+    print(f"[Review] 可选，状态={review_label}")
 
     baseline = file_status(feature_dir / "00-baseline.md")
     research = file_status(feature_dir / "01-research.md")
+    sql_draft = file_status(feature_dir / "sql-draft.sql")
     design = file_status(feature_dir / "02-design.md")
     tasks = file_status(feature_dir / "03-tasks.md")
     schema = file_status(feature_dir / "04-schema.sql")
@@ -84,7 +104,7 @@ def main() -> None:
     code_review = file_status(feature_dir / "06-code-review.md")
     test_report = file_status(feature_dir / "07-test-report.md")
     interface_details = dir_status(feature_dir / "interface-details")
-    print(f"[文档] baseline={baseline} | research={research} | design={design} | "
+    print(f"[文档] baseline={baseline} | research={research} | sql-draft={sql_draft} | design={design} | "
           f"tasks={tasks} | schema={schema} | implementation-log={implementation_log} | "
           f"code-review={code_review} | test-report={test_report} | interface-details={interface_details}")
 

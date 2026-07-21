@@ -1,4 +1,4 @@
 interface:
   display_name: "GGG Technical Design"
-  short_description: "轻量设计可实现的 Java 后端方案、契约与数据变更"
-  default_prompt: "使用 $ggg-technical-design 基于已闭合的需求和代码结论完成最小、可实现的后端技术方案，并在任务拆分前确认必要的数据库变更。"
+  short_description: "SQL Gate 闭合后设计后端方案与统一接口索引"
+  default_prompt: "使用 $ggg-technical-design 在需求、代码事实和 SQL Gate 均闭合后编写最小可实现的后端方案，并维护统一接口设计索引。"

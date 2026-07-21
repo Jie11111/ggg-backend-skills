@@ -1,4 +1,4 @@
 interface:
   display_name: "GGG Implementation"
-  short_description: "按风险实现已确认任务，用新鲜验证绑定当前真实代码差异"
-  default_prompt: "使用 $ggg-implementation 按已确认任务选择风险档位，完成编码前预检、纵向实现、真实命令验证并锁定当前差异。"
+  short_description: "实现任务与单点续改，局部修正不重走完整需求链路"
+  default_prompt: "使用 $ggg-implementation 完成编码；若我主动提出一个明确的已有行为修正，只改必要代码和直接相关联调文档并编译验证。"

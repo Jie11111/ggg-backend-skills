@@ -32,6 +32,8 @@ CANONICAL_STAGE_FILES = {
     "01-research.md",
     "02-design.md",
     "03-tasks.md",
+    # 新版 full 流程在需求对齐阶段先锁定 SQL 语义；04-schema.sql 仅兼容旧需求。
+    "sql-draft.sql",
     "04-schema.sql",
     "05-implementation-log.md",
     "06-code-review.md",
@@ -80,6 +82,15 @@ BASELINE_REQUIRED_TOKENS = [
     "## 8. 验收标准",
 ]
 
+BASELINE_V5_REQUIRED_TOKENS = [
+    *BASELINE_REQUIRED_TOKENS,
+    "<!-- GGG_SCHEMA_VERSION: 5 -->",
+    "- 推荐模式：",
+    "- 推荐依据：",
+    "- 最终模式：",
+    "- 模式选择来源：",
+]
+
 RESEARCH_REQUIRED_TOKENS = [
     "## 1. Baseline 验证清单",
     "## 2. 主链路代码事实",
@@ -97,6 +108,16 @@ RESEARCH_REQUIRED_TOKENS = [
 RESEARCH_V2_REQUIRED_TOKENS = [
     *RESEARCH_REQUIRED_TOKENS,
     "### 6.1 共享状态、枚举和类型语义影响矩阵",
+]
+
+RESEARCH_V3_REQUIRED_TOKENS = [
+    *RESEARCH_V2_REQUIRED_TOKENS,
+    "### 7.1 SQL 影响与确认准备",
+    "- SQL 影响类型：",
+    "- SQL 草案：",
+    "- SQL 确认状态：",
+    "- SQL 确认来源：",
+    "- SQL 语义指纹：",
 ]
 
 LEGACY_RESEARCH_REQUIRED_TOKENS = [
@@ -147,6 +168,23 @@ DESIGN_V5_REQUIRED_TOKENS = [
     "禁止外部传字段",
 ]
 
+DESIGN_V6_REQUIRED_TOKENS = [
+    token
+    for token in DESIGN_V5_REQUIRED_TOKENS
+    if token != "## 五、SQL 变更说明"
+] + [
+    "<!-- GGG_DESIGN_SCHEMA_VERSION: 6 -->",
+    "- SQL 影响类型：",
+    "- SQL 确认来源：",
+    "- SQL 语义指纹：",
+    "## 五、已确认 SQL 引用",
+    "- 异常与失败边界：",
+    "- 业务日志：",
+    "- Trace 链路：",
+    "## 八、接口设计",
+    "| 接口名称 | 新增/修改 | 请求方式 | 路径/方法 | 所属项目 | 接口文档地址 | 备注 |",
+]
+
 INTERFACE_DETAIL_REQUIRED_TOKENS = [
     "## 1. 基本信息",
     "## 2. 契约与参数",
@@ -161,6 +199,24 @@ INTERFACE_DETAIL_V3_REQUIRED_TOKENS = [
     "| 调用方 / 触发事件 |",
     "外部是否允许传",
     "- 输出副作用：",
+]
+
+INTERFACE_DETAIL_V4_REQUIRED_TOKENS = [
+    *INTERFACE_DETAIL_REQUIRED_TOKENS,
+    "<!-- GGG_INTERFACE_SCHEMA_VERSION: 4 -->",
+    "| 契约类型 |",
+    "| 调用方 / 触发事件 |",
+    "外部是否允许传",
+    "- 输出副作用：",
+    "| 接口名称 |",
+    "| 新增/修改 |",
+    "| 请求方式 |",
+    "| 路径/方法 |",
+    "| 接口文档地址 |",
+    "| 备注 |",
+    "| 字段 | 位置 | Java 类型 | JSON 类型 | 必填 | 可空/空值语义 | 示例值 | 来源 | 是否后端推导 | 外部是否允许传 | 说明 |",
+    "| 字段 | Java 类型 | JSON 类型 | 必返 | 可空/空值语义 | 说明 |",
+    "- 数值精度与序列化：",
 ]
 
 TASK_REQUIRED_TOKENS = [
@@ -178,6 +234,16 @@ TASK_V2_REQUIRED_TOKENS = [
     "## 4. 任务详情",
     "## 5. 完成定义",
     "- 必要测试代码：",
+    "- 最小验证：",
+]
+
+TASK_V3_REQUIRED_TOKENS = [
+    "## 1. 编码范围",
+    "## 2. 拆分依据",
+    "## 3. 任务总览",
+    "## 4. 任务详情",
+    "## 5. 完成定义",
+    "- 测试代码：",
     "- 最小验证：",
 ]
 
@@ -205,6 +271,17 @@ CODE_REVIEW_ROUND_REQUIRED_TOKENS = [
     "## 7. 评审结论",
 ]
 
+CODE_REVIEW_SIMPLE_REQUIRED_TOKENS = [
+    "<!-- GGG_REVIEW_SCHEMA_VERSION: 2 -->",
+    "## 1. 检查范围",
+    "## 2. 两项检查",
+    "| 检查项 | 结论 | 问题与定位 |",
+    "| 代码与需求是否有偏差 |",
+    "| 代码质量与格式 |",
+    "## 3. 结论",
+    "- 结论：",
+]
+
 TEST_REPORT_INDEX_REQUIRED_TOKENS = [
     "## 1. 测试轮次索引",
     "## 2. 当前测试结论",
@@ -222,11 +299,9 @@ TEST_REPORT_ROUND_REQUIRED_TOKENS = [
     "## 8. 工件清单",
 ]
 
-QUICK_RECORD_REQUIRED_TOKENS = [
-    "<!-- GGG_QUICK_SCHEMA_VERSION: 2 -->",
+QUICK_RECORD_COMMON_REQUIRED_TOKENS = [
     "## 1. 边界确认",
     "- 推进模式：",
-    "- 路由依据：",
     "- 代表性验收例：",
     "- 失败 / 重复触发补充：",
     "- 兼容性检查：",
@@ -238,3 +313,46 @@ QUICK_RECORD_REQUIRED_TOKENS = [
     "实现会话状态文件",
     "Review 对应实现轮次",
 ]
+
+QUICK_RECORD_V2_REQUIRED_TOKENS = [
+    *QUICK_RECORD_COMMON_REQUIRED_TOKENS,
+    "<!-- GGG_QUICK_SCHEMA_VERSION: 2 -->",
+    "- 路由依据：",
+]
+
+QUICK_RECORD_V3_REQUIRED_TOKENS = [
+    *QUICK_RECORD_COMMON_REQUIRED_TOKENS,
+    "<!-- GGG_QUICK_SCHEMA_VERSION: 3 -->",
+    "- 推荐模式：",
+    "- 推荐依据：",
+    "- 最终模式：",
+    "- 模式选择来源：",
+    "- Review 处置：",
+    "- Review 结论：",
+    "- Review Gate 是否满足：",
+    "- Review 跳过来源：",
+    "- Light Review 简要结论：",
+    "### 5.1 Formal Review 两门复核（仅 formal）",
+]
+
+QUICK_RECORD_V4_REQUIRED_TOKENS = [
+    *[
+        token
+        for token in QUICK_RECORD_COMMON_REQUIRED_TOKENS
+        if token != "## 5. Review / 测试结论"
+    ],
+    "## 5. 可选 Review / 测试结论",
+    "<!-- GGG_QUICK_SCHEMA_VERSION: 4 -->",
+    "- 推荐模式：",
+    "- 推荐依据：",
+    "- 最终模式：",
+    "- 模式选择来源：",
+    "- Review 状态：",
+    "- Review 结论：",
+    "- Review 未解决问题：",
+    "### 5.1 可选 Review",
+    "| 检查项 | 结论 | 问题与定位 |",
+]
+
+# 兼容仍直接导入旧常量名的调用方；最新模板使用 v4。
+QUICK_RECORD_REQUIRED_TOKENS = QUICK_RECORD_V4_REQUIRED_TOKENS

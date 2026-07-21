@@ -4,9 +4,9 @@
 
 ## 1. 测试轮次索引
 
-| 轮次 | 时间 | 模式 | 结论 | 对应实现/Review | 明细文档 | 关联接口报告 | 未关闭缺口 |
+| 轮次 | 时间 | 模式 | 结论 | 对应实现 | 明细文档 | 关联接口报告 | 未关闭缺口 |
 |---|---|---|---|---|---|---|---|
-| T1 |  | formal-gate / run-only / triage | 通过 / 需补测 / 阻塞 / 局部观察 / 已定位 | I1 / R1 | test-rounds/test-r01.md | 不涉及 / reports/api-tests/xxx.md | 无 / TV1 |
+| T1 |  | formal-gate / run-only / triage | 通过 / 需补测 / 阻塞 / 局部观察 / 已定位 | I1 | test-rounds/test-r01.md | 不涉及 / reports/api-tests/xxx.md | 无 / TV1 |
 
 ## 2. 当前测试结论
 
@@ -15,8 +15,8 @@
 - 当前结论：
 - 测试阶段是否完成：
 - 对应实现轮次与差异指纹：
-- 对应 Review 轮次：
-- 需要回到实现或评审的问题：
+- Review 输入：未执行 / 可选参考 `06-code-review.md`
+- 需要回到实现的问题：
 - 剩余风险：
 
 ## 3. 缺口账本（含历史）
